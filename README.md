@@ -1,4 +1,4 @@
-# 视频解析插件（com.ucbk.video）
+# 视频解析插件（cn.ucbk.video）
 
 群聊或私聊里贴抖音、B站、小红书链接，机器人先回一条**描述卡片**（标题、作者、时长、互动数据、作品简介），紧接着把**视频**发出来；只有 QQ 真的拒收（体积过大、格式不支持）时才补一条无水印直链。默认不限时长。
 
@@ -16,7 +16,7 @@
 
 ```bash
 python plugins/pack.py video-parser
-# 生成 plugins/dist/com.ucbk.video-1.1.2.zip
+# 生成 plugins/dist/cn.ucbk.video-1.1.3.zip
 ```
 
 1. 插件市场 → 提交压缩包，上传上面的 zip；
