@@ -29,7 +29,6 @@ DEFAULT_TRIGGERS = "解析,视频解析"
 # 0 表示不限时长：宿主给数字型配置项的默认值是 0，若把 0 当成「上限 0 秒」，
 # 任何视频都会被判超限、只能发链接，所以这里必须把 0 解释成不设限。
 DEFAULT_MAX_DURATION = 0
-DEFAULT_MAX_IMAGES = 3
 DEFAULT_COOLDOWN = 15
 DEFAULT_CACHE_SECONDS = 600
 
@@ -40,7 +39,9 @@ MAX_DESC_LENGTH = 260
 MIN_DESC_LENGTH = 4
 MAX_TRIGGER_COUNT = 10
 MAX_DURATION_LIMIT = 3600
-MAX_IMAGES_LIMIT = 9
+# NapCat 对单条消息里的 image 段数量和总大小都比较敏感，图文作品分批发送。
+# 3 张一批兼顾消息数量与发送稳定性；单批失败时还会逐张降级重试。
+IMAGE_BATCH_SIZE = 3
 MAX_COOLDOWN = 300
 MAX_CACHE_SECONDS = 3600
 
@@ -270,20 +271,68 @@ async def _send_video(host: Any, event: dict[str, Any], media: dict[str, Any]) -
 
 
 async def _send_images(
-    host: Any, event: dict[str, Any], media: dict[str, Any], config: dict[str, int]
+    host: Any, event: dict[str, Any], media: dict[str, Any]
 ) -> None:
-    """图文作品发前几张原图，再补一条带描述的说明。"""
-    images = [item for item in media.get("images") or [] if item][: config["max_images"]]
-    if not images:
+    """
+    图文作品按批发送全部原图，再补一条描述卡片。
+
+    QQ/NapCat 对单条消息里的图片段数量有限制，3 张以上混在一起容易丢段或触发限速。
+    这里把图片切成 3 张一条，每条只发图片段；描述另起一条文字消息发。
+    不限制图片张数：作品里有多少张就发多少张。
+    单批发送失败时会自动按单张降级重试，尽量不让前面已发的丢失。
+    """
+    all_images = [item for item in media.get("images") or [] if item]
+    total = len(all_images)
+
+    # 没有任何图片时直接回文字卡片，避免「已发 0/0 张原图」这种空话。
+    if not total:
         await _reply(host, event, _link_card(media))
         return
+
+    # 按 IMAGE_BATCH_SIZE 分批；最后一批可能少于 3 张，按真实长度走。
+    sent = 0
+    for index in range(0, total, IMAGE_BATCH_SIZE):
+        batch = all_images[index : index + IMAGE_BATCH_SIZE]
+        # 单批失败时按单张重试：丢一张比丢整批更能保住已发送的内容。
+        if not await _send_image_batch(host, event, batch):
+            recovered = 0
+            for url in batch:
+                if await _send_image_batch(host, event, [url]):
+                    recovered += 1
+            sent += recovered
+            host.log(
+                f"图文第 {index // IMAGE_BATCH_SIZE + 1} 批降级重试："
+                f"原 {len(batch)} 张，发成 {recovered} 张",
+                "warning",
+            )
+        else:
+            sent += len(batch)
+
+    # 张数不设上限，但个别图仍可能被 QQ 拒收；失败时提示点链接看全。
+    note = ""
+    if sent < total:
+        note = (
+            f"已发 {sent}/{total} 张原图，"
+            f"其余 {total - sent} 张请点链接查看：{media.get('source_url') or ''}"
+        ).strip()
+    await _reply(host, event, _describe(media, note))
+
+
+async def _send_image_batch(
+    host: Any, event: dict[str, Any], urls: list[str]
+) -> bool:
+    """
+    单独发一批图片，被拒绝时只记日志，返回是否整批成功。
+
+    图片段单独成消息，不与文本段混排：NapCat 在多 image 段 + 文本段一起发时，
+    部分版本会丢掉文本段，这与「描述 + 视频」拆两条发是同一个原因。
+    """
+    if not urls:
+        return True
     segments: list[dict[str, Any]] = [
-        {"type": "image", "data": {"file": url}} for url in images
+        {"type": "image", "data": {"file": url}} for url in urls
     ]
-    total = len(media.get("images") or [])
-    note = f"已发 {len(images)}/{total} 张原图" if total > len(images) else ""
-    segments.append(_as_text(_describe(media, note)))
-    await _reply(host, event, segments)
+    return await _safe_reply(host, event, segments, "发送图文")
 
 
 async def _dispatch_parse(
@@ -357,14 +406,6 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
         "max_duration": _int_config(
             host, "max_duration", DEFAULT_MAX_DURATION, 0, MAX_DURATION_LIMIT
         ),
-        "max_images": _int_config(
-            host,
-            "max_images",
-            DEFAULT_MAX_IMAGES,
-            1,
-            MAX_IMAGES_LIMIT,
-            zero_as_default=True,
-        ),
     }
 
     cache_seconds = _seconds_config(
@@ -395,7 +436,7 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
 
     try:
         if media.get("kind") == "images":
-            await _send_images(host, event, media, config)
+            await _send_images(host, event, media)
             return
 
         note = ""

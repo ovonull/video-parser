@@ -64,12 +64,6 @@
       "sensitive": false
     },
     {
-      "key": "max_images",
-      "label": "图文作品发送张数",
-      "type": "number",
-      "required": false,
-      "sensitive": false
-    },    {
       "key": "cooldown_seconds",
       "label": "同一链接重复解析冷却（秒，0 或留空为默认 15，-1 关闭）",
       "type": "number",
