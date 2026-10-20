@@ -21,8 +21,8 @@ from typing import Any
 
 from app.services.plugin_sdk import PluginCallError, on_message
 
-from vparse import bilibili, common, douyin, jimengai, pipigx, xiaohongshu
-from vparse import doubao
+from vparse import bilibili, common, douyin, jimengai, kuaishou, pipigx
+from vparse import doubao, pipixia, toutiao, weibo, xiaohongshu
 from vparse.cache import MediaCache
 from vparse.common import VideoParseError
 
@@ -360,6 +360,15 @@ async def _send_images(
         ).strip()
     await _reply(host, event, _describe(media, note))
 
+    # 实况作品（LivePhoto）除了静态图还带一段短视频，单独发一条。
+    live_url = common.text_of(media.get("live_video_url"))
+    if live_url:
+        segment = {"type": "video", "data": {"file": live_url}}
+        if not await _safe_reply(host, event, [segment], "发送实况视频"):
+            await _safe_reply(
+                host, event, "实况视频发送失败，可点原链接查看。", "实况视频兜底"
+            )
+
 
 async def _send_image_batch(
     host: Any, event: dict[str, Any], urls: list[str]
@@ -517,9 +526,22 @@ async def _dispatch_parse(
         return await doubao.parse(
             url, _text_config(host, "doubao_cookie", ""), host
         )
+    if platform == "kuaishou":
+        return await kuaishou.parse(
+            url, _text_config(host, "kuaishou_cookie", ""), host, quality
+        )
+    if platform == "toutiao":
+        return await toutiao.parse(url, "", host, quality)
+    if platform == "weibo":
+        return await weibo.parse(
+            url, _text_config(host, "weibo_cookie", ""), host, quality
+        )
+    if platform == "pipixia":
+        return await pipixia.parse(url, "", host, quality)
     raise VideoParseError(
         "暂不支持这个平台",
-        "目前支持抖音、B 站、小红书、皮皮搞笑、即梦 AI 与豆包 AI",
+        "目前支持抖音、B 站、小红书、快手、今日头条、微博、皮皮搞笑、"
+        "皮皮虾、即梦 AI 与豆包 AI",
     )
 
 

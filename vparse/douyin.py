@@ -338,6 +338,47 @@ async def _fetch_item(aweme_id: str, cookie: str, host: Any) -> dict[str, Any] |
     return None
 
 
+def _live_photo_url(images: list[Any]) -> str:
+    """
+    取实况作品（LivePhoto）里那段短视频的地址。
+
+    实况作品的静态图元素上还挂着 video 节点，里面是这段短视频的信息：
+    `playAddr[]`（驼峰）或 `play_addr.url_list`（蛇形）里是播放地址。
+    多个地址时沿用视频那边的挑法：优先 v3-web，v26-web 换成对应域名。
+    最后把 playwm 换成 play，就是无水印地址。
+    """
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        video = image.get("video")
+        if not isinstance(video, dict):
+            continue
+        urls: list[str] = []
+        # 驼峰写法：playAddr[].src
+        play_addr = video.get("playAddr")
+        if isinstance(play_addr, list):
+            for item in play_addr:
+                if isinstance(item, dict):
+                    src = common.text_of(item.get("src"))
+                    if src:
+                        urls.append(src)
+        # 蛇形写法：play_addr.url_list
+        snake = video.get("play_addr")
+        if isinstance(snake, dict):
+            url_list = snake.get("url_list")
+            if isinstance(url_list, list):
+                for item in url_list:
+                    text = common.text_of(item)
+                    if text:
+                        urls.append(text)
+        if not urls:
+            continue
+        url = _prefer_host(urls)
+        if url:
+            return common.https_url(url.replace("playwm", "play"))
+    return ""
+
+
 def _build(item: dict[str, Any], source_url: str, wanted: int | None) -> dict[str, Any]:
     """把作品节点转成统一结构，视频与图集分开处理。"""
     video = item.get("video") or {}
@@ -375,6 +416,11 @@ def _build(item: dict[str, Any], source_url: str, wanted: int | None) -> dict[st
                 media["images"].append(common.https_url(url))
         if not media["images"]:
             raise VideoParseError("这条图文作品里没有取到图片地址")
+        # 实况作品（LivePhoto）除了静态图，还带一段短视频：
+        # 地址在 images[].video 里，playwm 换成 play 就是无水印地址。
+        live = _live_photo_url(images)
+        if live:
+            media["live_video_url"] = live
         return media
 
     picked = _pick_video(_video_candidates(video), wanted)

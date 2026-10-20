@@ -79,6 +79,44 @@ PLATFORM_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "kuaishou",
+        re.compile(
+            r"https?://(?:[\w-]+\.)?kuaishou\.com/\S*?"
+            r"(?:short-video|long-video|photo)/[A-Za-z0-9_-]+"
+            r"|https?://(?:[\w-]+\.)?gifshow\.com/\S*?"
+            r"(?:short-video|long-video|photo)/[A-Za-z0-9_-]+"
+            r"|https?://v\.kuaishou\.com/[A-Za-z0-9_-]+",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "toutiao",
+        re.compile(
+            r"https?://(?:www\.|m\.)?toutiao\.com/(?:video|article|i)/\d{10,25}"
+            r"|https?://(?:www\.|m\.)?toutiao\.com/w/\d{6,25}"
+            r"|https?://m\.toutiao\.com/i\d{10,25}",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "weibo",
+        re.compile(
+            r"https?://(?:video\.)?weibo\.com/tv/(?:show|v)/\d+"
+            r"|https?://(?:video\.)?weibo\.com/show[^\s]*?fid=\d+"
+            r"|https?://(?:www\.|m\.)?weibo\.com/\S*?[?&]fid=\d+"
+            r"|https?://t\.cn/\S+",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pipixia",
+        re.compile(
+            r"https?://(?:[\w-]+\.)?pipix\.com/\S*?[?&]cell_id=[A-Za-z0-9_-]+"
+            r"|https?://(?:[\w-]+\.)?pipix\.com/(?:ppx_article|article)/",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 # 消息里没有 http 前缀时补全，方便用户直接粘 v.douyin.com/xxx 这种半截链接。
@@ -86,7 +124,10 @@ BARE_LINK = re.compile(
     r"(?<![A-Za-z0-9.])((?:v\.douyin\.com|b23\.tv|xhslink\.com|"
     r"(?:www\.|m\.)?douyin\.com|(?:www\.)?iesdouyin\.com|"
     r"(?:www\.|m\.)?bilibili\.com|(?:www\.)?xiaohongshu\.com|"
-    r"(?:www\.)?doubao\.com|(?:www\.)?jimeng\.jianying\.com)/[^\s\u4e00-\u9fff]+)",
+    r"(?:www\.)?doubao\.com|(?:www\.)?jimeng\.jianying\.com|"
+    r"(?:[\w-]+\.)?kuaishou\.com|(?:[\w-]+\.)?gifshow\.com|"
+    r"(?:www\.|m\.)?toutiao\.com|(?:video\.)?weibo\.com|t\.cn|"
+    r"(?:[\w-]+\.)?pipix\.com)/[^\s\u4e00-\u9fff]+)",
     re.IGNORECASE,
 )
 
@@ -208,15 +249,31 @@ def text_of(value: Any) -> str:
 
 
 def first_url(node: Any) -> str:
-    """从 {url_list: [...]} 这类结构里取第一个地址。"""
+    """
+    从 {url_list: [...]} 这类结构里取第一个地址。
+
+    抖音图集的地址字段有三种叫法（urlList / url_list），且有时首个元素是占位符，
+    所以按「驼峰写法 → 蛇形写法 → 末位兜底」的顺序取，尽量把图取全。
+    """
     if not isinstance(node, dict):
         return ""
+    # 驼峰写法：urlList[0]
+    camel = node.get("urlList")
+    if isinstance(camel, list):
+        for item in camel:
+            text = text_of(item)
+            if text:
+                return text
+    # 蛇形写法：url_list[0]
     urls = node.get("url_list") or []
     if isinstance(urls, list):
         for item in urls:
             text = text_of(item)
             if text:
                 return text
+        # 末位兜底：有些作品首个元素是占位符，末位才是真地址。
+        if urls:
+            return text_of(urls[-1])
     return ""
 
 
