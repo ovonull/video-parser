@@ -34,6 +34,17 @@ QUALITY_TABLE = {
     6: (240, "240P"),
 }
 
+# 安装配置里的清晰度名称 → playurl 的 qn 降级序列。
+# 从选中的那一档开始往下试：选了 1080P 但视频只有 720P 时，仍能拿到视频而不是报错。
+QUALITY_CHOICES: dict[str, tuple[int, ...]] = {
+    "自动最高": (80, 64, 32, 16),
+    "1080P": (80, 64, 32, 16),
+    "720P": (64, 32, 16),
+    "480P": (32, 16),
+    "360P": (16,),
+}
+DEFAULT_QUALITY = common.DEFAULT_QUALITY
+
 BVID_PATTERN = re.compile(r"(BV[0-9A-Za-z]{10})")
 AID_PATTERN = re.compile(r"/video/av(\d+)", re.IGNORECASE)
 PAGE_PATTERN = re.compile(r"[?&]p=(\d+)")
@@ -105,18 +116,28 @@ def _page_title(data: dict[str, Any], page: int) -> str:
     return common.text_of(pages[index].get("part"))
 
 
+def quality_chain(name: str) -> tuple[int, ...]:
+    """把安装配置里的清晰度名称换成 qn 降级序列，不认识的值按「自动最高」处理。"""
+    return QUALITY_CHOICES.get(
+        str(name or "").strip(), QUALITY_CHOICES[DEFAULT_QUALITY]
+    )
+
+
 async def _pick_play_url(
-    bvid: str, cid: int, cookie: str, host: Any
+    bvid: str, cid: int, cookie: str, host: Any, chain: tuple[int, ...] | None = None
 ) -> tuple[str, str]:
     """
-    取单文件播放地址，按 1080P → 720P → 480P → 360P 逐级降级。
+    取单文件播放地址，按配置给的清晰度序列逐级降级。
+
+    Args:
+        chain: qn 降级序列；不传时用「自动最高」的 1080P → 720P → 480P → 360P。
 
     Returns:
         (播放地址, 清晰度名称)。
     """
     headers = _api_headers(cookie)
     last_message = ""
-    for qn in (80, 64, 32, 16):
+    for qn in chain or QUALITY_CHOICES[DEFAULT_QUALITY]:
         result = await host.http_request(
             "GET",
             PLAY_API,
@@ -156,7 +177,9 @@ async def _pick_play_url(
     )
 
 
-async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
+async def parse(
+    url: str, cookie: str, host: Any, quality: str = DEFAULT_QUALITY
+) -> dict[str, Any]:
     """
     解析一条 B 站链接。
 
@@ -164,6 +187,7 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
         url: 视频详情页链接、b23.tv 短链或 BV/av 号链接。
         cookie: 安装配置里的 B 站 Cookie，可为空。
         host: 插件宿主视图。
+        quality: 安装配置里的清晰度名称，决定从哪一档开始取；默认「自动最高」。
     Returns:
         统一结构的媒体信息。
     Raises:
@@ -191,8 +215,12 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
     if not cid:
         raise VideoParseError("这个视频没有可播放的分集信息")
 
-    play_url, quality = await _pick_play_url(
-        common.text_of(data.get("bvid")) or bvid, cid, cookie, host
+    play_url, quality_label = await _pick_play_url(
+        common.text_of(data.get("bvid")) or bvid,
+        cid,
+        cookie,
+        host,
+        quality_chain(quality),
     )
     owner = data.get("owner") or {}
     return {
@@ -207,7 +235,7 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
         "cover": common.https_url(common.text_of(data.get("pic"))),
         "play_url": play_url,
         "images": [],
-        "quality": quality,
+        "quality": quality_label,
         "part": _page_title(data, page),
         "source_url": url,
     }

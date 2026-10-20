@@ -336,18 +336,20 @@ async def _send_image_batch(
 
 
 async def _dispatch_parse(
-    host: Any, platform: str, url: str
+    host: Any, platform: str, url: str, quality: str
 ) -> dict[str, Any]:
     """按平台调用对应解析器。"""
     if platform == "douyin":
-        return await douyin.parse(url, _text_config(host, "douyin_cookie", ""), host)
+        return await douyin.parse(
+            url, _text_config(host, "douyin_cookie", ""), host, quality
+        )
     if platform == "bilibili":
         return await bilibili.parse(
-            url, _text_config(host, "bilibili_cookie", ""), host
+            url, _text_config(host, "bilibili_cookie", ""), host, quality
         )
     if platform == "xiaohongshu":
         return await xiaohongshu.parse(
-            url, _text_config(host, "xhs_cookie", ""), host
+            url, _text_config(host, "xhs_cookie", ""), host, quality
         )
     raise VideoParseError("暂不支持这个平台", "目前支持抖音、B 站与小红书")
 
@@ -406,19 +408,24 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
         "max_duration": _int_config(
             host, "max_duration", DEFAULT_MAX_DURATION, 0, MAX_DURATION_LIMIT
         ),
+        "video_quality": _choice(host, "video_quality", common.DEFAULT_QUALITY),
     }
 
     cache_seconds = _seconds_config(
         host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
     )
-    cache_key = f"{platform}:{url}"
+    # 清晰度会直接改变 play_url（抖音多档码率、B 站 qn、小红书多条码流），
+    # 缓存键必须带上它，否则用户换了清晰度后，缓存里旧的播放地址还会被发出去。
+    cache_key = f"{platform}:{url}:{config['video_quality']}"
     media = _media_cache.get(cache_key) if cache_seconds else None
     if media is not None:
         host.log(f"命中解析缓存：{common.clip(url, 80)}")
     else:
         host.log(f"开始解析 {platform}：{common.clip(url, 120)}")
         try:
-            media = await _dispatch_parse(host, platform, url)
+            media = await _dispatch_parse(
+                host, platform, url, config["video_quality"]
+            )
         except VideoParseError as error:
             host.log(f"解析失败：{error.message}", "warning")
             await _reply(host, event, f"解析失败：{error.message}" + (f"\n{error.hint}" if error.hint else ""))

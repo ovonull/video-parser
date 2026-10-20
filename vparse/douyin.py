@@ -31,6 +31,9 @@ SHARE_PAGE_CHARS = 120000
 ATTEMPTS = 3
 RETRY_GAP = 0.3
 
+# 抖音码率档位编号对应的视频高度，取自 video.bit_rate[].quality_type。
+QUALITY_TYPE_HEIGHT = {32: 540, 54: 720, 80: 1080}
+
 # 作品节点里的互动数据，字段 → 展示标签。
 STAT_PAIRS: tuple[tuple[Any, str], ...] = (
     ("digg_count", "点赞"),
@@ -130,7 +133,46 @@ async def _fetch_item(aweme_id: str, cookie: str, host: Any) -> dict[str, Any] |
     return None
 
 
-def _build(item: dict[str, Any], source_url: str) -> dict[str, Any]:
+def _clean_play_url(url: str) -> str:
+    """分享页给 playwm 是带水印版本，换成 play 拿无水印。"""
+    text = str(url or "")
+    return text.replace("playwm", "play") if "playwm" in text else text
+
+
+def _int_of(value: Any, default: int = 0) -> int:
+    """把接口里的数字字段转成 int，拿不准时返回默认值。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _video_candidates(video: dict[str, Any]) -> list[tuple[int, str, str]]:
+    """
+    收集抖音这条作品的可用清晰度，返回 (高度, 展示名称, 地址)。
+
+    抖音把多档码率放在 video.bit_rate 里，每档带 quality_type 与各自的 play_addr，
+    这才是清晰度真正的来源。play_addr / download_addr 只是单个默认地址，
+    由调用方在没有可用档位时按原逻辑兜底，这里不重复收进候选。
+    """
+    candidates: list[tuple[int, str, str]] = []
+    for item in video.get("bit_rate") or []:
+        if not isinstance(item, dict):
+            continue
+        url = _clean_play_url(common.first_url(item.get("play_addr")))
+        if not url:
+            continue
+        height = QUALITY_TYPE_HEIGHT.get(_int_of(item.get("quality_type")), 0)
+        label = common.text_of(item.get("gear_name")) or (
+            f"{height}P" if height else ""
+        )
+        candidates.append((height, label, url))
+    return candidates
+
+
+def _build(
+    item: dict[str, Any], source_url: str, wanted: int | None
+) -> dict[str, Any]:
     """把作品节点转成统一结构，视频与图集分开处理。"""
     video = item.get("video") or {}
     images = item.get("images") or []
@@ -176,6 +218,18 @@ def _build(item: dict[str, Any], source_url: str) -> dict[str, Any]:
         raise VideoParseError(
             "作品里没有找到可播放的地址", "可能是直播回放、合集或受限作品"
         )
+
+    # 有多档码率就按配置的清晰度挑；没有档位信息时退回原来的单地址逻辑。
+    picked = common.pick_by_height(_video_candidates(video), wanted)
+    if picked is not None:
+        height, label, url = picked
+        media["play_url"] = url
+        # 高度也拿不到时不写 quality，保持与旧结构一致。
+        label = label or (f"{height}P" if height else "")
+        if label:
+            media["quality"] = label
+        return media
+
     # 分享页给 playwm 是带水印版本，换成 play 拿无水印。
     if "playwm" in play_url:
         play_url = play_url.replace("playwm", "play")
@@ -183,7 +237,9 @@ def _build(item: dict[str, Any], source_url: str) -> dict[str, Any]:
     return media
 
 
-async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
+async def parse(
+    url: str, cookie: str, host: Any, quality: str = common.DEFAULT_QUALITY
+) -> dict[str, Any]:
     """
     解析一条抖音链接。
 
@@ -191,6 +247,7 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
         url: 抖音视频或图文链接（含短链）。
         cookie: 安装配置里的抖音 Cookie，可为空。
         host: 插件宿主视图。
+        quality: 安装配置里的清晰度名称，决定在多档码率里选哪一档。
     Returns:
         统一结构的媒体信息。
     Raises:
@@ -208,4 +265,4 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
             "抖音没有返回视频数据",
             "作品可能已删除、设为私密，或触发了风控；在插件配置里填抖音 Cookie 后成功率更高",
         )
-    return _build(item, url)
+    return _build(item, url, common.quality_target(quality))

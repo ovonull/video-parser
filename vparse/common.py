@@ -206,6 +206,52 @@ def https_url(url: str) -> str:
     return text
 
 
+DEFAULT_QUALITY = "自动最高"
+
+# 安装配置里的清晰度名称 → 目标高度（像素）。None 表示不设上限，取最高可用。
+QUALITY_TARGETS: dict[str, int | None] = {
+    "自动最高": None,
+    "1080P": 1080,
+    "720P": 720,
+    "480P": 480,
+    "360P": 360,
+}
+
+
+def quality_target(name: str) -> int | None:
+    """把配置里的清晰度名称换成目标高度；不认识的值按「自动最高」处理。"""
+    return QUALITY_TARGETS.get(
+        str(name or "").strip(), QUALITY_TARGETS[DEFAULT_QUALITY]
+    )
+
+
+def pick_by_height(
+    candidates: list[tuple[int, str, str]], wanted: int | None
+) -> tuple[int, str, str] | None:
+    """
+    按目标高度在候选清晰度里选一条。
+
+    规则：取**不超过目标高度的最高一档**（省流量、所选档不存在时自动退档）；
+    「自动最高」则取最高一档。
+
+    Args:
+        candidates: (高度, 展示名称, 地址) 列表，高度为 0 表示未知。
+        wanted: 目标高度；None 表示不限。
+    Returns:
+        选中的 (高度, 名称, 地址)。**一个带高度的候选都没有时返回 None**，
+        交回调用方按原方式取地址——页面没给分辨率信息时行为保持不变。
+    """
+    known = [item for item in candidates if item[0] > 0 and item[2]]
+    if not known:
+        return None
+    if wanted is None:
+        return max(known, key=lambda item: item[0])
+    fitted = [item for item in known if item[0] <= wanted]
+    if fitted:
+        return max(fitted, key=lambda item: item[0])
+    return min(known, key=lambda item: item[0])
+
+
 def format_duration(seconds: Any) -> str:
     """把秒数格式化成 03:25 或 1:02:03，取值异常时返回空字符串。"""
     try:

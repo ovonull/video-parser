@@ -156,6 +156,53 @@ def video_url(video: dict[str, Any]) -> str:
     return ""
 
 
+def _int_of(value: Any, default: int = 0) -> int:
+    """把页面里的数字字段转成 int，拿不准时返回默认值。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _entry_height(entry: dict[str, Any]) -> int:
+    """从码流条目里读视频高度；没有分辨率元数据时返回 0。"""
+    for key in ("height", "videoHeight", "video_height"):
+        value = _int_of(entry.get(key))
+        if value:
+            return value
+    return 0
+
+
+def _video_candidates(video: dict[str, Any]) -> list[tuple[int, str, str]]:
+    """
+    收集视频的可用清晰度，返回 (高度, 展示名称, 地址)。
+
+    小红书把多档码流放在 media.stream 的各个编码数组里，一个编码下可能有多条不同分辨率；
+    新版结构则放在 media.video.bitrate 里。只有页面确实给出分辨率时才收候选，
+    拿不到高度就返回空列表，让调用方退回原来的取第一条逻辑（行为不变）。
+    """
+    if not isinstance(video, dict):
+        return []
+    sources: list[Any] = []
+    stream = ((video.get("media") or {}).get("stream") or {})
+    for key in STREAM_KEYS:
+        sources.extend(stream.get(key) or [])
+    sources.extend(((video.get("media") or {}).get("video") or {}).get("bitrate") or [])
+
+    candidates: list[tuple[int, str, str]] = []
+    for entry in sources:
+        if not isinstance(entry, dict):
+            continue
+        url = _stream_url(entry)
+        if not url:
+            continue
+        height = _entry_height(entry)
+        if not height:
+            continue
+        candidates.append((height, f"{height}P", url))
+    return candidates
+
+
 def _image_url(image: Any) -> str:
     """取图片原图地址，优先 urlDefault，其次 infoList 的最后一项。"""
     if not isinstance(image, dict):
@@ -226,7 +273,7 @@ def _stats(note: dict[str, Any]) -> list[str]:
     return parts
 
 
-def build(note: dict[str, Any], source_url: str) -> dict[str, Any]:
+def build(note: dict[str, Any], source_url: str, wanted: int | None) -> dict[str, Any]:
     """把笔记节点转成统一结构，视频与图文分开处理。"""
     video = note.get("video") or {}
     user = note.get("user") or {}
@@ -244,6 +291,14 @@ def build(note: dict[str, Any], source_url: str) -> dict[str, Any]:
         "images": [],
         "source_url": source_url,
     }
+
+    # 页面给了分辨率元数据就按配置的清晰度挑；没有就按编码优先级取第一条（行为不变）。
+    picked = common.pick_by_height(_video_candidates(video), wanted)
+    if picked is not None:
+        _, label, url = picked
+        media["play_url"] = url
+        media["quality"] = label
+        return media
 
     play_url = video_url(video)
     if play_url:
@@ -291,7 +346,9 @@ def _redirect_error(location: str) -> VideoParseError:
     )
 
 
-async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
+async def parse(
+    url: str, cookie: str, host: Any, quality: str = common.DEFAULT_QUALITY
+) -> dict[str, Any]:
     """
     解析一条小红书链接。
 
@@ -299,6 +356,7 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
         url: 笔记链接，支持 /explore/、/discovery/item/ 与 xhslink.com 短链。
         cookie: 安装配置里的小红书 Cookie，必填。
         host: 插件宿主视图。
+        quality: 安装配置里的清晰度名称；页面没给分辨率时忽略。
     Returns:
         统一结构的媒体信息。
     Raises:
@@ -350,4 +408,4 @@ async def parse(url: str, cookie: str, host: Any) -> dict[str, Any]:
             "笔记页里没有笔记内容",
             "笔记可能已删除、设为私密，或当前账号无权查看",
         )
-    return build(note, url)
+    return build(note, url, common.quality_target(quality))
