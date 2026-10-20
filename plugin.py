@@ -53,12 +53,27 @@ _last_reply: dict[str, tuple[float, str]] = {}
 # 跨会话的解析结果缓存：同一条链接被不同的人反复粘贴时不再重复请求平台。
 _media_cache = MediaCache(64)
 
-# 后台任务集合：发送视频、批量发图这类慢动作放进来跑。
+# 后台任务集合：解析、发送这些慢动作放进来跑。
 #
 # 宿主对单个事件的处理有时间上限（默认 10 秒），超时就重启插件子进程。
-# 而发视频要等 NapCat 把文件下载、转发、上传完，回执经常要好几秒甚至更久，
-# 放在事件里等就会把事件拖到超时。所以这里让事件先结束，慢动作在后台继续。
+# 而这些动作都很慢：解析要等平台接口（分享页还会重试三次，每次 8 秒超时），
+# 发送要等 NapCat 把文件下载、转发、上传完。放在事件里等就会把事件拖到超时，
+# 子进程被重启后，已经发出的内容会残缺（多图作品表现为「10 张只到 9 张」），
+# 连最后那条描述卡片也一起丢掉。所以这里让事件先结束，慢动作在后台继续。
 _background_tasks: set[asyncio.Task] = set()
+
+# 后台流水线之间的串行锁：同一时刻只跑一条「解析 + 发送」，
+# 免得两条链接的图文交叉着发，读起来乱。
+# 延迟创建，兼容不同 Python 版本对锁的绑定时机。
+_pipeline_lock: asyncio.Lock | None = None
+
+
+def _pipeline_guard() -> asyncio.Lock:
+    """取后台流水线的串行锁。"""
+    global _pipeline_lock
+    if _pipeline_lock is None:
+        _pipeline_lock = asyncio.Lock()
+    return _pipeline_lock
 
 
 def _spawn(coro: Any) -> None:
@@ -383,12 +398,99 @@ async def _deliver_video(host: Any, event: dict[str, Any], media: dict[str, Any]
         host.log(f"后台发送视频失败：{error}", "warning")
 
 
-async def _deliver_images(host: Any, event: dict[str, Any], media: dict[str, Any]) -> None:
-    """后台发送图文作品，异常只记日志，不影响宿主。"""
+async def _resolve_media(
+    host: Any, event: dict[str, Any], platform: str, url: str, config: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    取作品数据：命中缓存直接用，否则解析。
+
+    失败时把提示发给用户并返回 None，不往上抛异常。
+    """
+    cache_seconds = _seconds_config(
+        host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
+    )
+    # 清晰度会直接改变 play_url（抖音多档码率、B 站 qn、小红书多条码流），
+    # 缓存键必须带上它，否则用户换了清晰度后，缓存里旧的播放地址还会被发出去。
+    cache_key = f"{platform}:{url}:{config['video_quality']}"
+    media = _media_cache.get(cache_key) if cache_seconds else None
+    if media is not None:
+        host.log(f"命中解析缓存：{common.clip(url, 80)}")
+        return media
+
+    host.log(f"开始解析 {platform}：{common.clip(url, 120)}")
     try:
-        await _send_images(host, event, media)
+        media = await _dispatch_parse(host, platform, url, config["video_quality"])
+    except VideoParseError as error:
+        host.log(f"解析失败：{error.message}", "warning")
+        await _reply(
+            host,
+            event,
+            f"解析失败：{error.message}" + (f"\n{error.hint}" if error.hint else ""),
+        )
+        return None
     except PluginCallError as error:
-        host.log(f"后台发送图文失败：{error}", "warning")
+        host.log(f"出网请求被拒绝或失败：{error}", "error")
+        await _reply(host, event, "解析服务暂时不可用，请稍后再试。")
+        return None
+    except Exception as error:  # 插件内部兜底，不让异常冒到宿主
+        host.log(f"解析出现未预期错误：{type(error).__name__}: {error}", "error")
+        await _reply(host, event, "解析出错了，请稍后再试。")
+        return None
+    # 播放地址自带有效期，缓存时间由安装配置控制，过期后重新解析。
+    _media_cache.put(cache_key, media, cache_seconds)
+    return media
+
+
+async def _deliver_media(
+    host: Any, event: dict[str, Any], media: dict[str, Any], config: dict[str, Any]
+) -> None:
+    """按作品类型把内容发回会话。"""
+    if media.get("kind") == "images":
+        await _send_images(host, event, media)
+        return
+
+    note = ""
+    if _over_duration(media, config):
+        note = (
+            f"视频时长 {common.format_duration(media.get('duration'))} 超过上限 "
+            f"{common.format_duration(config['max_duration'])}，请点链接观看"
+        )
+    # 只发链接模式，或视频超时长上限：一条消息说完，卡片里带描述与直链。
+    if config["send_video"] != "发送视频" or note:
+        await _reply(host, event, _link_card(media, note))
+        return
+
+    # 描述和视频分两条发：混在同一个消息段数组里时，
+    # 部分 NapCat 版本会丢掉文本段，表现就是「只有视频、没有说明」。
+    await _safe_reply(host, event, _describe(media), "发送视频说明")
+    await _deliver_video(host, event, media)
+
+
+async def _run_pipeline(
+    host: Any, event: dict[str, Any], platform: str, url: str, config: dict[str, Any]
+) -> None:
+    """
+    后台跑完一整条流水线：解析 → 发送。
+
+    整条链路都放后台，是因为两段都可能很慢：解析要等平台接口
+    （分享页还会重试三次，每次 8 秒超时），发送要等 NapCat 转发文件。
+    只要有一段留在事件里，事件就可能被拖到宿主的时间上限（默认 10 秒），
+    宿主随即重启插件子进程——正在发的图会连同最后那条描述卡片一起丢掉，
+    表现就是「10 张图只到了 9 张」。
+
+    用一把锁把多条流水线串起来：同一个机器人同时收到两条链接时，
+    后一条要等前一条发完，消息顺序不会乱。
+    """
+    try:
+        async with _pipeline_guard():
+            media = await _resolve_media(host, event, platform, url, config)
+            if media is None:
+                return
+            await _deliver_media(host, event, media, config)
+    except PluginCallError as error:
+        host.log(f"发送消息失败：{error}", "error")
+    except Exception as error:  # 后台任务异常只记日志，不能影响宿主
+        host.log(f"流水线出现未预期错误：{type(error).__name__}: {error}", "error")
 
 
 async def _dispatch_parse(
@@ -478,58 +580,7 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
         "video_quality": _choice(host, "video_quality", common.DEFAULT_QUALITY),
     }
 
-    cache_seconds = _seconds_config(
-        host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
-    )
-    # 清晰度会直接改变 play_url（抖音多档码率、B 站 qn、小红书多条码流），
-    # 缓存键必须带上它，否则用户换了清晰度后，缓存里旧的播放地址还会被发出去。
-    cache_key = f"{platform}:{url}:{config['video_quality']}"
-    media = _media_cache.get(cache_key) if cache_seconds else None
-    if media is not None:
-        host.log(f"命中解析缓存：{common.clip(url, 80)}")
-    else:
-        host.log(f"开始解析 {platform}：{common.clip(url, 120)}")
-        try:
-            media = await _dispatch_parse(
-                host, platform, url, config["video_quality"]
-            )
-        except VideoParseError as error:
-            host.log(f"解析失败：{error.message}", "warning")
-            await _reply(host, event, f"解析失败：{error.message}" + (f"\n{error.hint}" if error.hint else ""))
-            return
-        except PluginCallError as error:
-            host.log(f"出网请求被拒绝或失败：{error}", "error")
-            await _reply(host, event, "解析服务暂时不可用，请稍后再试。")
-            return
-        except Exception as error:  # 插件内部兜底，不让异常冒到宿主
-            host.log(f"解析出现未预期错误：{type(error).__name__}: {error}", "error")
-            await _reply(host, event, "解析出错了，请稍后再试。")
-            return
-        # 播放地址自带有效期，缓存时间由安装配置控制，过期后重新解析。
-        _media_cache.put(cache_key, media, cache_seconds)
-
-    try:
-        if media.get("kind") == "images":
-            # 图片也要一张张传，同样可能拖到事件超时，放后台发。
-            _spawn(_deliver_images(host, event, media))
-            return
-
-        note = ""
-        if _over_duration(media, config):
-            note = (
-                f"视频时长 {common.format_duration(media.get('duration'))} 超过上限 "
-                f"{common.format_duration(config['max_duration'])}，请点链接观看"
-            )
-        # 只发链接模式，或视频超时长上限：一条消息说完，卡片里带描述与直链。
-        if config["send_video"] != "发送视频" or note:
-            await _reply(host, event, _link_card(media, note))
-            return
-
-        # 描述和视频分两条发：混在同一个消息段数组里时，
-        # 部分 NapCat 版本会丢掉文本段，表现就是「只有视频、没有说明」。
-        await _safe_reply(host, event, _describe(media), "发送视频说明")
-        # 视频放到后台发：NapCat 转发大文件很慢，等它回执会把事件拖到宿主超时，
-        # 那样插件子进程会被重启，反而影响后续消息。
-        _spawn(_deliver_video(host, event, media))
-    except PluginCallError as error:
-        host.log(f"发送消息失败：{error}", "error")
+    # 整条流水线（解析 + 发送）都放到后台，事件立刻结束。
+    # 事件里等解析或等发送，都会撞上宿主的事件时间上限（默认 10 秒），
+    # 宿主一超时就重启插件子进程，正在发的东西会丢在半路。
+    _spawn(_run_pipeline(host, event, platform, url, config))
