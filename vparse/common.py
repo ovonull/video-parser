@@ -58,13 +58,35 @@ PLATFORM_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    (
+        "pipigx",
+        re.compile(
+            r"https?://(?:[\w-]+\.)?(?:pipigx\.com|ippzone\.com)/\S*?[?&]pid=\d+",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "jimengai",
+        re.compile(
+            r"https?://(?:[\w-]+\.)?(?:jimeng\.jianying\.com|dreamina\.capcut\.com)/\S*?[?&]item_id=[\w-]+",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "doubao",
+        re.compile(
+            r"https?://(?:www\.)?doubao\.com/\S*?[?&](?:share_id|video_id)=",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 # 消息里没有 http 前缀时补全，方便用户直接粘 v.douyin.com/xxx 这种半截链接。
 BARE_LINK = re.compile(
     r"(?<![A-Za-z0-9.])((?:v\.douyin\.com|b23\.tv|xhslink\.com|"
     r"(?:www\.|m\.)?douyin\.com|(?:www\.)?iesdouyin\.com|"
-    r"(?:www\.|m\.)?bilibili\.com|(?:www\.)?xiaohongshu\.com)/[^\s\u4e00-\u9fff]+)",
+    r"(?:www\.|m\.)?bilibili\.com|(?:www\.)?xiaohongshu\.com|"
+    r"(?:www\.)?doubao\.com|(?:www\.)?jimeng\.jianying\.com)/[^\s\u4e00-\u9fff]+)",
     re.IGNORECASE,
 )
 
@@ -250,6 +272,76 @@ def pick_by_height(
     if fitted:
         return max(fitted, key=lambda item: item[0])
     return min(known, key=lambda item: item[0])
+
+
+XHS_IMAGE_HOST = "sns-img-hw.xhscdn.com"
+XHS_IMAGE_CI_HOST = "ci.xiaohongshu.com"
+
+
+def xhs_image_url(url: str, width: int = 0) -> str:
+    """
+    把小红书图片地址整理成带处理参数的形式。
+
+    小红书的图片清晰度是用 URL 参数控制的：``imageView2/2/w/{宽度}/format/jpg``，
+    宽度填 0 表示不限（即原图宽度），填具体数值就是限宽压缩。
+
+    Args:
+        url: 原始图片地址。
+        width: 限宽像素，0 表示原图。
+    Returns:
+        整理后的地址；地址形态不认识时原样返回。
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    tail = text.split("://", 1)[-1]
+    host = tail.split("/", 1)[0].lower()
+    # 只处理小红书的图片域名，其他地址原样返回。
+    if "xhscdn.com" not in host and "xiaohongshu.com" not in host:
+        return text
+    path = tail[tail.find("/") + 1 :] if "/" in tail else ""
+    path = path.split("?")[0].split("#")[0]
+    if not path:
+        return text
+    parts = [seg for seg in path.split("/") if seg]
+    if not parts:
+        return text
+    # 末段里可能带 !风格后缀（如 abc!nd_dft_wlteh_webp_3），那一段是装饰，去掉。
+    last = parts[-1].split("!")[0]
+    if not last:
+        return text
+    limit = max(0, int(width or 0))
+    suffix = f"?imageView2/2/w/{limit}/format/jpg"
+    if len(parts) >= 2:
+        directory = "/".join(parts[:-1])
+        return f"https://{XHS_IMAGE_HOST}/{directory}/{last}{suffix}"
+    return f"https://{XHS_IMAGE_CI_HOST}/{last}{suffix}"
+
+
+def find_text(node: Any, *keys: str) -> str:
+    """
+    在嵌套结构里递归找第一个有值的字符串字段。
+
+    平台接口的字段名不完全统一（snake_case / camelCase、video_url / play_url），
+    这里按候选名逐个深搜，拿到第一个非空字符串就用。
+    """
+    if isinstance(node, dict):
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return str(value)
+        for value in node.values():
+            found = find_text(value, *keys)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_text(item, *keys)
+            if found:
+                return found
+    return ""
 
 
 def format_duration(seconds: Any) -> str:

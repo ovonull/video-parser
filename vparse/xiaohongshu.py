@@ -203,20 +203,27 @@ def _video_candidates(video: dict[str, Any]) -> list[tuple[int, str, str]]:
     return candidates
 
 
-def _image_url(image: Any) -> str:
-    """取图片原图地址，优先 urlDefault，其次 infoList 的最后一项。"""
+def _image_url(image: Any, width: int = 0) -> str:
+    """
+    取图片原图地址。
+
+    优先 urlDefault，其次 infoList 的最后一项；取到后统一整理成带处理参数的形式，
+    这样才能按需限宽（width 为 0 表示原图宽度）。
+    """
     if not isinstance(image, dict):
         return ""
     url = common.text_of(image.get("urlDefault")) or common.text_of(image.get("url"))
-    if url:
-        return common.https_url(url)
-    info = image.get("infoList") or []
-    if isinstance(info, list):
-        for item in reversed(info):
-            text = common.text_of((item or {}).get("url"))
-            if text:
-                return common.https_url(text)
-    return ""
+    if not url:
+        info = image.get("infoList") or []
+        if isinstance(info, list):
+            for item in reversed(info):
+                text = common.text_of((item or {}).get("url"))
+                if text:
+                    url = text
+                    break
+    if not url:
+        return ""
+    return common.xhs_image_url(url, width)
 
 
 def _duration(video: dict[str, Any]) -> int | None:
@@ -273,7 +280,9 @@ def _stats(note: dict[str, Any]) -> list[str]:
     return parts
 
 
-def build(note: dict[str, Any], source_url: str, wanted: int | None) -> dict[str, Any]:
+def build(
+    note: dict[str, Any], source_url: str, wanted: int | None
+) -> dict[str, Any]:
     """把笔记节点转成统一结构，视频与图文分开处理。"""
     video = note.get("video") or {}
     user = note.get("user") or {}
@@ -305,13 +314,18 @@ def build(note: dict[str, Any], source_url: str, wanted: int | None) -> dict[str
         media["play_url"] = play_url
         return media
 
+    # 图文作品：图片清晰度用小红书的 imageView2 参数控制，wanted 就是限宽像素，
+    # None（自动最高）表示不限宽度、取原图。
+    width = int(wanted or 0)
     for image in note.get("imageList") or []:
-        url = _image_url(image)
+        url = _image_url(image, width)
         if url:
             media["images"].append(url)
     if media["images"]:
         media["kind"] = "images"
         media["duration"] = None
+        if width:
+            media["quality"] = f"限宽 {width}"
         return media
 
     raise VideoParseError(

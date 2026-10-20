@@ -37,13 +37,17 @@ QUALITY_TABLE = {
 # 安装配置里的清晰度名称 → playurl 的 qn 降级序列。
 # 从选中的那一档开始往下试：选了 1080P 但视频只有 720P 时，仍能拿到视频而不是报错。
 QUALITY_CHOICES: dict[str, tuple[int, ...]] = {
-    "自动最高": (80, 64, 32, 16),
-    "1080P": (80, 64, 32, 16),
-    "720P": (64, 32, 16),
+    "自动最高": (116, 112, 80, 74, 64, 32, 16),
+    "1080P": (116, 112, 80, 74, 64, 32, 16),
+    "720P": (74, 64, 32, 16),
     "480P": (32, 16),
     "360P": (16,),
 }
 DEFAULT_QUALITY = common.DEFAULT_QUALITY
+
+# 播放地址偶尔会带区域边缘节点（如 cn-fjqz-cm-01-03.bilivideo.com），
+# 这类节点对第三方取流容易 403。换成中机房域名可绕过防盗链限制。
+MIRROR_HOST = "upos-sz-mirrorhw.bilivideo.com"
 
 BVID_PATTERN = re.compile(r"(BV[0-9A-Za-z]{10})")
 AID_PATTERN = re.compile(r"/video/av(\d+)", re.IGNORECASE)
@@ -121,6 +125,25 @@ def quality_chain(name: str) -> tuple[int, ...]:
     return QUALITY_CHOICES.get(
         str(name or "").strip(), QUALITY_CHOICES[DEFAULT_QUALITY]
     )
+
+
+def mirror_play_url(url: str) -> str:
+    """
+    把播放地址的 CDN 域名换成中机房域名，路径与鉴权参数原样保留。
+
+    区域边缘节点（cn-fjqz-cm-01 之类）偶尔会对取流返回 403，
+    换成 upos-sz-mirrorhw 即可正常播放；非 B 站地址或已是对应域名时原样返回。
+    """
+    text = str(url or "")
+    if not text.startswith("http"):
+        return text
+    head, sep, tail = text.partition("://")
+    if not sep:
+        return text
+    host, slash, path = tail.partition("/")
+    if not host.endswith(".bilivideo.com") or host == MIRROR_HOST:
+        return text
+    return f"{head}://{MIRROR_HOST}{slash}{path}"
 
 
 async def _pick_play_url(
@@ -234,6 +257,7 @@ async def parse(
         "duration": int(data.get("duration") or 0) or None,
         "cover": common.https_url(common.text_of(data.get("pic"))),
         "play_url": play_url,
+        "play_url_mirror": mirror_play_url(play_url),
         "images": [],
         "quality": quality_label,
         "part": _page_title(data, page),

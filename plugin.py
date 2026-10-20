@@ -20,7 +20,8 @@ from typing import Any
 
 from app.services.plugin_sdk import PluginCallError, on_message
 
-from vparse import bilibili, common, douyin, xiaohongshu
+from vparse import bilibili, common, douyin, jimengai, pipigx, xiaohongshu
+from vparse import doubao
 from vparse.cache import MediaCache
 from vparse.common import VideoParseError
 
@@ -264,10 +265,18 @@ async def _send_video(host: Any, event: dict[str, Any], media: dict[str, Any]) -
     所以这里单独捕获异常，不影响已经发出去的描述。
     """
     segment = {"type": "video", "data": {"file": media["play_url"]}}
-    if not await _safe_reply(host, event, [segment], "发送视频"):
-        return False
-    host.log(f"已发送视频：{common.clip(media.get('title'), 40)}")
-    return True
+    if await _safe_reply(host, event, [segment], "发送视频"):
+        host.log(f"已发送视频：{common.clip(media.get('title'), 40)}")
+        return True
+    # 原地址被拒多半是 CDN 区域节点的防盗链，换中机房域名再试一次。
+    mirror = media.get("play_url_mirror") or ""
+    if mirror and mirror != media.get("play_url"):
+        host.log("视频被拒，换中机房 CDN 地址重试", "warning")
+        retry = {"type": "video", "data": {"file": mirror}}
+        if await _safe_reply(host, event, [retry], "发送视频（中机房重试）"):
+            host.log(f"已发送视频：{common.clip(media.get('title'), 40)}")
+            return True
+    return False
 
 
 async def _send_images(
@@ -351,7 +360,18 @@ async def _dispatch_parse(
         return await xiaohongshu.parse(
             url, _text_config(host, "xhs_cookie", ""), host, quality
         )
-    raise VideoParseError("暂不支持这个平台", "目前支持抖音、B 站与小红书")
+    if platform == "pipigx":
+        return await pipigx.parse(url, "", host)
+    if platform == "jimengai":
+        return await jimengai.parse(url, "", host)
+    if platform == "doubao":
+        return await doubao.parse(
+            url, _text_config(host, "doubao_cookie", ""), host
+        )
+    raise VideoParseError(
+        "暂不支持这个平台",
+        "目前支持抖音、B 站、小红书、皮皮搞笑、即梦 AI 与豆包 AI",
+    )
 
 
 @on_message

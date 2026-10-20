@@ -29,9 +29,12 @@ video-parser/
 └── vparse/
     ├── __init__.py           # 解析工具包
     ├── common.py             # 链接识别、短链跳转、格式化与公共异常
-    ├── douyin.py             # 抖音分享页解析
+    ├── douyin.py             # 抖音解析（免 Cookie 详情接口 + 原画直链）
     ├── bilibili.py           # B站 Web 接口解析
     ├── xiaohongshu.py        # 小红书笔记页解析
+    ├── pipigx.py             # 皮皮搞笑解析
+    ├── jimengai.py           # 即梦 AI 解析
+    ├── doubao.py             # 豆包 AI 解析
     └── cache.py              # 解析结果缓存
 ```
 
@@ -90,12 +93,13 @@ video-parser/
 
 ### 抖音
 
-插件请求 `iesdouyin` 分享页，读取页面内嵌的 `window._ROUTER_DATA`，不需要实现抖音签名算法。
+插件优先请求**免 Cookie 详情接口** `api.amemv.com/aweme/v1/aweme/detail/`，直接拿到结构化的作品数据；接口不可用时再退回 `iesdouyin` 分享页内嵌的 `window._ROUTER_DATA`，不需要实现抖音签名算法。
 
-- 视频作品：提取无水印播放地址；如果地址包含 `playwm`，会尝试替换为 `play`。
-- 图文作品：提取全部原图地址，按每批 3 张分批发送，不限张数。
-- 分享页前几次可能只返回空壳页面，插件会自动重试，最多请求 3 次。
-- 抖音没有独立标题时，会使用文案第一行作为标题。
+- 视频作品：按 `bitRate` 码率降序挑选最高画质档位，地址优先用 `v3-web` 域名；
+- 原画：取 `play_addr.uri`（vid）拼出播放地址，跟随 302 拿到真正的无水印文件；
+- 图文作品：提取全部原图地址，按每批 3 张分批发送，不限张数；
+- 分享页前几次可能只返回空壳页面，插件会自动重试，最多请求 3 次；
+- 抖音没有独立标题时，会使用文案第一行作为标题；
 - 抖音 Cookie 可用于提高触发风控时的解析成功率。
 
 ### 哔哩哔哩（B站）
@@ -104,7 +108,8 @@ video-parser/
 
 1. 调用 `x/web-interface/view` 获取标题、封面、作者、时长和互动数据；
 2. 调用 `x/player/playurl` 获取单文件 MP4 播放地址；
-3. 按 1080P、720P、480P、360P 顺序逐级尝试。
+3. 按 1080P60、1080P+、1080P、720P60、720P、480P、360P 顺序逐级尝试；
+4. 视频被 QQ 拒收时，自动换成中机房 CDN 域名重试一次，避开区域边缘节点的防盗链。
 
 使用 `platform=html5` 获取带音轨的单文件视频，因此不需要 ffmpeg 合流。支持 BV 号、av 号、多 P 视频和 `b23.tv` 短链。
 
@@ -112,12 +117,25 @@ video-parser/
 
 小红书没有在本插件中使用公开 API，而是读取笔记页面内嵌的 `window.__INITIAL_STATE__`：
 
-- 视频笔记：读取 `media.stream` 中的播放地址；
+- 视频笔记：读取 `media.stream` 中的播放地址，页面给了分辨率元数据时按配置的清晰度挑选；
 - 图文笔记：读取 `imageList` 中的原图地址；
+- 图片清晰度用小红书的 `imageView2` 处理参数控制（`w/0` 为原图宽度，填具体数值即限宽压缩）；
 - 页面中的 JavaScript `undefined` 会先转换为 JSON 可识别的 `null`；
 - 未登录访问通常会跳转到登录页或 404 页面，因此必须配置有效 Cookie。
 
 小红书 Cookie 至少应包含 `a1` 和 `web_session`。Cookie 过期后，需要重新从浏览器开发者工具中复制。
+
+### 皮皮搞笑
+
+分享链接里带 `pid` 与 `mid`，插件 POST 到官方分享接口 `h5.pipigx.com/ppapi/share/fetch_content` 取作品数据，包含文案、视频地址与封面。
+
+### 即梦 AI
+
+分享链接里带 `item_id`，插件 POST 到 `jimeng.jianying.com/mweb/v1/get_item_info` 取作品数据。视频地址优先取 `transcoded.origin`，即**原画**文件。
+
+### 豆包 AI
+
+分享链接里带 `share_id` 与 `video_id`，插件 POST 到 `www.doubao.com/creativity/share/get_video_share_info` 取作品数据。接口字段名各版本不完全一致，插件用深度检索兜底取播放地址与封面。
 
 ## 工作流程
 
