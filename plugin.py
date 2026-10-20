@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -51,6 +52,24 @@ _last_reply: dict[str, tuple[float, str]] = {}
 
 # 跨会话的解析结果缓存：同一条链接被不同的人反复粘贴时不再重复请求平台。
 _media_cache = MediaCache(64)
+
+# 后台任务集合：发送视频、批量发图这类慢动作放进来跑。
+#
+# 宿主对单个事件的处理有时间上限（默认 10 秒），超时就重启插件子进程。
+# 而发视频要等 NapCat 把文件下载、转发、上传完，回执经常要好几秒甚至更久，
+# 放在事件里等就会把事件拖到超时。所以这里让事件先结束，慢动作在后台继续。
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro: Any) -> None:
+    """把协程丢到后台执行，并持有引用防止被垃圾回收。"""
+    try:
+        task = asyncio.ensure_future(coro)
+    except RuntimeError:  # 没有事件循环时退化为不执行
+        coro.close()
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _text_config(host: Any, key: str, default: str) -> str:
@@ -344,6 +363,34 @@ async def _send_image_batch(
     return await _safe_reply(host, event, segments, "发送图文")
 
 
+async def _deliver_video(host: Any, event: dict[str, Any], media: dict[str, Any]) -> None:
+    """
+    后台发送视频；被 QQ 拒收时补一条直链。
+
+    单独拆出来是为了让事件能尽快结束：发视频要等 NapCat 完成下载与上传，
+    回执经常超过宿主给事件的时间上限。
+    """
+    try:
+        if await _send_video(host, event, media):
+            return
+        # 视频被 QQ 拒收，补一条直链；描述已经发过了，这里不再重复。
+        play_url = media.get("play_url") or ""
+        fallback = (
+            f"无水印直链：{play_url}" if play_url else "视频发送失败，请稍后再试。"
+        )
+        await _safe_reply(host, event, fallback, "补发直链")
+    except PluginCallError as error:
+        host.log(f"后台发送视频失败：{error}", "warning")
+
+
+async def _deliver_images(host: Any, event: dict[str, Any], media: dict[str, Any]) -> None:
+    """后台发送图文作品，异常只记日志，不影响宿主。"""
+    try:
+        await _send_images(host, event, media)
+    except PluginCallError as error:
+        host.log(f"后台发送图文失败：{error}", "warning")
+
+
 async def _dispatch_parse(
     host: Any, platform: str, url: str, quality: str
 ) -> dict[str, Any]:
@@ -463,7 +510,8 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
 
     try:
         if media.get("kind") == "images":
-            await _send_images(host, event, media)
+            # 图片也要一张张传，同样可能拖到事件超时，放后台发。
+            _spawn(_deliver_images(host, event, media))
             return
 
         note = ""
@@ -480,11 +528,8 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
         # 描述和视频分两条发：混在同一个消息段数组里时，
         # 部分 NapCat 版本会丢掉文本段，表现就是「只有视频、没有说明」。
         await _safe_reply(host, event, _describe(media), "发送视频说明")
-        if await _send_video(host, event, media):
-            return
-        # 视频被 QQ 拒收，补一条直链；上面已经发过标题与描述，这里不再重复。
-        play_url = media.get("play_url") or ""
-        fallback = f"无水印直链：{play_url}" if play_url else "视频发送失败，请稍后再试。"
-        await _safe_reply(host, event, fallback, "补发直链")
+        # 视频放到后台发：NapCat 转发大文件很慢，等它回执会把事件拖到宿主超时，
+        # 那样插件子进程会被重启，反而影响后续消息。
+        _spawn(_deliver_video(host, event, media))
     except PluginCallError as error:
         host.log(f"发送消息失败：{error}", "error")
