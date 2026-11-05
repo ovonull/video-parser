@@ -645,7 +645,12 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
         return
 
     platform, url = common.normalize_url(text)
-    auto = _choice(host, "auto_parse", "粘贴链接即解析") == "粘贴链接即解析"
+    mode = _choice(host, "auto_parse", "粘贴链接即解析")
+    if mode == "交给 AI 处理":
+        # 完全交给 AI 管线：它在需要时调 send_video，视频跟它的回复一起发出去。
+        # 插件这里不解析也不接管，否则 AI 那条会被顶掉，就没有接话和审核了。
+        return
+    auto = mode == "粘贴链接即解析"
     triggers = _parse_triggers(_text_config(host, "trigger_words", DEFAULT_TRIGGERS))
     if not auto:
         # 指令模式下必须**以触发词开头**才算命令，避免普通聊天里出现「解析」就被误触发。
@@ -751,50 +756,109 @@ async def tool_parse_video_link(
     命中后直接返回结果；缓存还没热时就短等一会儿，实在没有才自己解析一次。
     """
     try:
-        if not host.has("http.outbound"):
-            return _tool_error("本机器人未获批「访问外网」能力，视频解析不可用。")
-        raw = str(arguments.get("url") or "").strip()
-        if not raw:
-            return _tool_error("缺少要解析的视频链接。")
-        platform, url = common.normalize_url(raw)
-        if not platform:
-            return _tool_error("这条链接不是受支持的视频平台，无法解析。")
-
-        quality = _choice(host, "video_quality", common.DEFAULT_QUALITY)
-        cache_seconds = _seconds_config(
-            host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
-        )
-        cache_key = f"{platform}:{url}:{quality}"
-        media = _media_cache.get(cache_key) if cache_seconds else None
-
-        # 事件链路可能刚接管这条链接、还没解析完，短暂等它写缓存，避免重复出网。
-        if media is None and cache_seconds:
-            deadline = time.monotonic() + TOOL_CACHE_WAIT_SECONDS
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.2)
-                media = _media_cache.get(cache_key)
-                if media is not None:
-                    break
-
+        media, _platform, url, error = await _tool_resolve(host, arguments)
         if media is None:
-            host.log(f"AI 工具自行解析：{common.clip(url, 80)}")
-            try:
-                media = await asyncio.wait_for(
-                    _dispatch_parse(host, platform, url, quality),
-                    timeout=TOOL_PARSE_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                return _tool_error(
-                    "解析超时，请引用会话里已发出的描述卡片回答，不要编造视频内容。"
-                )
-            except VideoParseError as error:
-                return _tool_error(f"解析失败：{error.message}")
-            except PluginCallError as error:
-                return _tool_error(f"出网请求被拒绝或失败：{error}")
-            if not isinstance(media, dict):
-                return _tool_error("解析器没有返回有效结果。")
-            if cache_seconds:
-                _media_cache.put(cache_key, media, cache_seconds)
+            return _tool_error(error)
         return _tool_payload(media, url)
     except Exception as error:  # 工具异常只回一段可读文本，不中断对话循环
         return _tool_error(f"视频信息工具出错：{type(error).__name__}: {error}")
+
+
+@on_tool("send_video")
+async def tool_send_video(
+    arguments: dict[str, Any], host: Any
+) -> dict[str, Any]:
+    """解析视频并把媒体交给宿主，随 AI 的这次回复一起发出。
+
+    不自己调发送动作：返回 ``attachments``，宿主等回复生成完、审核通过、
+    文字发出去之后再紧接着补发。自己发就成了「先一句话、隔几秒再来条视频」。
+    """
+    try:
+        media, _platform, url, error = await _tool_resolve(host, arguments)
+        if media is None:
+            return _tool_error(error)
+        attachments, reason = _attachments_of(media)
+        if not attachments:
+            return _tool_error(reason or "这条作品没有可直接发送的视频或图片。")
+        payload = _tool_payload(media, url)
+        payload["attachments"] = attachments
+        payload["hint"] = (
+            "视频会随你这次回复一起发出。回复里说清它讲了什么、值不值得看，"
+            "不要贴链接、不要整段复述卡片，也不要再说「马上发给你」。"
+        )
+        return payload
+    except Exception as error:
+        return _tool_error(f"视频发送工具出错：{type(error).__name__}: {error}")
+
+
+async def _tool_resolve(
+    host: Any, arguments: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str, str, str]:
+    """解析链接，返回 ``(作品数据, 平台, 规范化地址, 失败原因)``。
+
+    两个工具共用这一段：都走同一份缓存，命中直接拿，没命中才自己出网，
+    避免和事件链路重复请求平台。
+    """
+    if not host.has("http.outbound"):
+        return None, "", "", "本机器人未获批「访问外网」能力，视频解析不可用。"
+    raw = str(arguments.get("url") or "").strip()
+    if not raw:
+        return None, "", "", "缺少要解析的视频链接。"
+    platform, url = common.normalize_url(raw)
+    if not platform:
+        return None, "", "", "这条链接不是受支持的视频平台，无法解析。"
+
+    quality = _choice(host, "video_quality", common.DEFAULT_QUALITY)
+    cache_seconds = _seconds_config(
+        host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
+    )
+    cache_key = f"{platform}:{url}:{quality}"
+    media = _media_cache.get(cache_key) if cache_seconds else None
+
+    # 事件链路可能刚接管这条链接、还没解析完，短暂等它写缓存，避免重复出网。
+    if media is None and cache_seconds:
+        deadline = time.monotonic() + TOOL_CACHE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            media = _media_cache.get(cache_key)
+            if media is not None:
+                break
+
+    if media is None:
+        host.log(f"AI 工具自行解析：{common.clip(url, 80)}")
+        try:
+            media = await asyncio.wait_for(
+                _dispatch_parse(host, platform, url, quality),
+                timeout=TOOL_PARSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return None, platform, url, "解析超时，请引用会话里已发出的描述卡片回答，不要编造视频内容。"
+        except VideoParseError as error:
+            return None, platform, url, f"解析失败：{error.message}"
+        except PluginCallError as error:
+            return None, platform, url, f"出网请求被拒绝或失败：{error}"
+        if not isinstance(media, dict):
+            return None, platform, url, "解析器没有返回有效结果。"
+        if cache_seconds:
+            _media_cache.put(cache_key, media, cache_seconds)
+    return media, platform, url, ""
+
+
+def _attachments_of(media: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """把作品数据转成宿主认识的附件，拿不到可发内容时给一句原因。
+
+    视频带一份备用地址：直链常有防盗链，主地址被拒时宿主会换备用地址重试。
+    """
+    if media.get("kind") == "images":
+        images = [str(item) for item in media.get("images") or [] if item]
+        if not images:
+            return [], "这条图文作品没有解析到图片。"
+        return [{"type": "image", "file": url} for url in images], ""
+    play_url = str(media.get("play_url") or "")
+    if not play_url:
+        return [], "没有解析到可播放地址。"
+    item: dict[str, Any] = {"type": "video", "file": play_url}
+    mirror = str(media.get("play_url_mirror") or "")
+    if mirror and mirror != play_url:
+        item["fallbacks"] = [mirror]
+    return [item], ""
