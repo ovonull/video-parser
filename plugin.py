@@ -19,7 +19,7 @@ import asyncio
 import time
 from typing import Any
 
-from app.services.plugin_sdk import PluginCallError, on_message
+from app.services.plugin_sdk import PluginCallError, on_message, on_tool
 
 from vparse import bilibili, common, douyin, jimengai, kuaishou, pipigx
 from vparse import doubao, pipixia, toutiao, weibo, xiaohongshu
@@ -693,3 +693,108 @@ async def handle_video(event: dict[str, Any], host: Any) -> None:
     # 事件里等解析或等发送，都会撞上宿主的事件时间上限（默认 10 秒），
     # 宿主一超时就重启插件子进程，正在发的东西会丢在半路。
     _spawn(_run_pipeline(host, event, platform, url, config))
+
+
+# ---------------------------------------------------------------------------
+# AI 工具：模型需要回答「这个视频讲什么」时来取解析结果。
+#
+# 事件链路收到链接后会自己解析、自己发描述卡片和视频，工具不重复这套动作：
+# 优先读同一份解析缓存，命中即返回，既省一次出网，也不会和后台流水线抢着发消息。
+# 工具调用在子进程里和事件共用一把锁，所以每一步都要限时，不能把事件派发堵死。
+# ---------------------------------------------------------------------------
+
+# 等事件链路把结果写进缓存的上限；解析通常 2-4 秒，留一点余量。
+TOOL_CACHE_WAIT_SECONDS = 4.0
+# 缓存没命中时自己解析的上限。超过就明确告诉模型别编，而不是让宿主把子进程重启掉。
+TOOL_PARSE_TIMEOUT_SECONDS = 8.0
+TOOL_DESC_LIMIT = 260
+
+
+def _tool_error(message: str) -> dict[str, Any]:
+    """工具失败时回一段模型读得懂的中文说明，不把异常抛给对话循环。"""
+    return {"ok": False, "error": message}
+
+
+def _tool_payload(media: dict[str, Any], url: str) -> dict[str, Any]:
+    """把作品数据收敛成模型好用的结构，附一份现成的描述卡片文本。"""
+    payload: dict[str, Any] = {
+        "ok": True,
+        "platform": str(media.get("platform_name") or ""),
+        "url": url,
+        "title": common.clip(media.get("title"), MAX_TITLE_LENGTH),
+        "author": str(media.get("author") or ""),
+        "duration": common.format_duration(media.get("duration")),
+        "stats": [str(item) for item in media.get("stats") or [] if item],
+        "desc": common.block(media.get("desc"), TOOL_DESC_LIMIT),
+        "kind": str(media.get("kind") or ""),
+        "image_count": len(media.get("images") or []),
+        "card": _describe(media),
+    }
+    play_url = str(media.get("play_url") or "")
+    if play_url:
+        payload["play_url"] = play_url
+    # 卡片和视频由事件链路发出，提醒模型别在回复里再播报一遍。
+    payload["hint"] = (
+        "描述卡片与视频已由插件自动发到会话里；回复时只用这些信息回答问题，"
+        "不要重复贴链接、不要整段复述卡片，也不要凭空补充没给到的内容。"
+    )
+    return payload
+
+
+@on_tool("parse_video_link")
+async def tool_parse_video_link(
+    arguments: dict[str, Any], host: Any
+) -> dict[str, Any]:
+    """返回一条视频链接的解析结果；只取数据，不发消息、不抢占消息。
+
+    与 ``handle_video`` 共用解析缓存：消息事件通常已在后台处理同一条链接，
+    命中后直接返回结果；缓存还没热时就短等一会儿，实在没有才自己解析一次。
+    """
+    try:
+        if not host.has("http.outbound"):
+            return _tool_error("本机器人未获批「访问外网」能力，视频解析不可用。")
+        raw = str(arguments.get("url") or "").strip()
+        if not raw:
+            return _tool_error("缺少要解析的视频链接。")
+        platform, url = common.normalize_url(raw)
+        if not platform:
+            return _tool_error("这条链接不是受支持的视频平台，无法解析。")
+
+        quality = _choice(host, "video_quality", common.DEFAULT_QUALITY)
+        cache_seconds = _seconds_config(
+            host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
+        )
+        cache_key = f"{platform}:{url}:{quality}"
+        media = _media_cache.get(cache_key) if cache_seconds else None
+
+        # 事件链路可能刚接管这条链接、还没解析完，短暂等它写缓存，避免重复出网。
+        if media is None and cache_seconds:
+            deadline = time.monotonic() + TOOL_CACHE_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
+                media = _media_cache.get(cache_key)
+                if media is not None:
+                    break
+
+        if media is None:
+            host.log(f"AI 工具自行解析：{common.clip(url, 80)}")
+            try:
+                media = await asyncio.wait_for(
+                    _dispatch_parse(host, platform, url, quality),
+                    timeout=TOOL_PARSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                return _tool_error(
+                    "解析超时，请引用会话里已发出的描述卡片回答，不要编造视频内容。"
+                )
+            except VideoParseError as error:
+                return _tool_error(f"解析失败：{error.message}")
+            except PluginCallError as error:
+                return _tool_error(f"出网请求被拒绝或失败：{error}")
+            if not isinstance(media, dict):
+                return _tool_error("解析器没有返回有效结果。")
+            if cache_seconds:
+                _media_cache.put(cache_key, media, cache_seconds)
+        return _tool_payload(media, url)
+    except Exception as error:  # 工具异常只回一段可读文本，不中断对话循环
+        return _tool_error(f"视频信息工具出错：{type(error).__name__}: {error}")
