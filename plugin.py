@@ -27,8 +27,9 @@ from vparse.common import VideoParseError
 DEFAULT_CACHE_SECONDS = 600
 MAX_CACHE_SECONDS = 3600
 MAX_TITLE_LENGTH = 80
-MAX_DESC_LENGTH = 260
-MIN_DESC_LENGTH = 4
+# 作品原文要完整给到模型：多数平台文案在几百字内，留足余量，别把后半段切掉。
+# 宿主 result_limit 会兜底裁剪整份工具结果，card 排在附件之前不会被先挤掉。
+MAX_DESC_LENGTH = 1200
 MAX_DURATION_LIMIT = 3600
 # 图文作品一次最多排队几张原图：太多会让补发拖得很久，也会挤占群消息。
 MAX_IMAGE_ATTACHMENTS = 9
@@ -80,7 +81,12 @@ def _seconds_config(host: Any, key: str, default: int, high: int) -> int:
 
 
 def _describe(media: dict[str, Any]) -> str:
-    """拼描述卡片：标题、作者与时长等元信息、互动数据、正文简介。"""
+    """拼描述卡片：标题、元信息、互动数据，以及发布者写的完整原文。
+
+    抖音这类平台没有独立标题，标题就是文案首行，所以原文原样再给一遍，
+    不再从正文里剥掉首行——剥掉就等于把那句原话藏起来了。短文案同样保留，
+    只挡掉纯重复字符的脏数据。
+    """
     title = common.flatten(media.get("title"))
     lines = [
         f"【{media.get('platform_name')}】"
@@ -104,14 +110,10 @@ def _describe(media: dict[str, Any]) -> str:
     if stats:
         lines.append(" · ".join(stats))
 
-    body = common.block(media.get("desc"), MAX_DESC_LENGTH + MAX_TITLE_LENGTH)
-    if title and body.startswith(title):
-        body = body[len(title) :].strip()
-    body = common.block(body, MAX_DESC_LENGTH)
-    if len(body) < MIN_DESC_LENGTH or len(set(body)) == 1:
-        body = ""
-    if body:
+    body = common.block(media.get("desc"), MAX_DESC_LENGTH)
+    if body and len(set(body)) > 1:
         lines.append("")
+        lines.append("作品原文：")
         lines.append(body)
     return "\n".join(lines)
 
@@ -202,9 +204,9 @@ def _tool_error(message: str) -> dict[str, Any]:
 def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
     """把作品数据收敛成模型好用的结构，并挂上待发媒体。
 
-    作品简介只通过 ``card`` 给一次：``card`` 已经把标题、作者、时长、互动数据
-    和正文简介排成一张描述卡片，再单独塞一份原始 ``desc`` 只是重复占上下文，
-    模型还容易照着原始文案整段复述。
+    作品文案只通过 ``card`` 给一次：``card`` 里既有标题、作者、时长、互动数据，
+    也有「作品原文」整段（含被当作标题的那一行），再单独塞一份 ``desc`` 只是
+    重复占上下文。模型能读到原话，但 ``hint`` 仍要求它不要整段照抄。
     """
     payload: dict[str, Any] = {
         "ok": True,
@@ -218,9 +220,10 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
         "image_count": len(media.get("images") or []),
         "card": _describe(media),
         "hint": (
-            "作品信息以 card 里的描述卡片为准；视频或图片已排队，会由系统紧跟着"
-            "你的回复发出。请按你的人设自然接话，可以点评作品，但不要贴链接、"
-            "不要整段复述卡片、不要说「已发送」，也不要编造工具没给到的信息。"
+            "作品信息以 card 为准，card 里的「作品原文」是发布者写的完整文案；"
+            "视频或图片已排队，会由系统紧跟着你的回复发出。请按你的人设自然接话，"
+            "可以引用原文里的原话，但不要贴链接、不要整段照抄卡片、不要说「已发送」，"
+            "也不要编造工具没给到的信息。"
         ),
     }
     # 放在最后：返回给模型时可能被长度裁剪，前面的信息不能先被挤掉。
