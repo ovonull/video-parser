@@ -32,7 +32,6 @@ MIN_DESC_LENGTH = 4
 MAX_DURATION_LIMIT = 3600
 # 图文作品一次最多排队几张原图：太多会让补发拖得很久，也会挤占群消息。
 MAX_IMAGE_ATTACHMENTS = 9
-TOOL_DESC_LIMIT = 260
 # 解析要等平台接口，分享页还会重试三次；给足时间，别让模型只拿到一句「超时」。
 TOOL_PARSE_TIMEOUT_SECONDS = 35.0
 
@@ -201,7 +200,12 @@ def _tool_error(message: str) -> dict[str, Any]:
 
 
 def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
-    """把作品数据收敛成模型好用的结构，并挂上待发媒体。"""
+    """把作品数据收敛成模型好用的结构，并挂上待发媒体。
+
+    作品简介只通过 ``card`` 给一次：``card`` 已经把标题、作者、时长、互动数据
+    和正文简介排成一张描述卡片，再单独塞一份原始 ``desc`` 只是重复占上下文，
+    模型还容易照着原始文案整段复述。
+    """
     payload: dict[str, Any] = {
         "ok": True,
         "platform": str(media.get("platform_name") or ""),
@@ -210,14 +214,13 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
         "author": str(media.get("author") or ""),
         "duration": common.format_duration(media.get("duration")),
         "stats": [str(item) for item in media.get("stats") or [] if item],
-        "desc": common.block(media.get("desc"), TOOL_DESC_LIMIT),
         "kind": str(media.get("kind") or ""),
         "image_count": len(media.get("images") or []),
         "card": _describe(media),
         "hint": (
-            "视频或图片已排队，会由系统紧跟着你的回复发出。请按你的人设自然接话，"
-            "可以点评作品，但不要贴链接、不要整段复述数据、不要说「已发送」，"
-            "也不要编造工具没给到的信息。"
+            "作品信息以 card 里的描述卡片为准；视频或图片已排队，会由系统紧跟着"
+            "你的回复发出。请按你的人设自然接话，可以点评作品，但不要贴链接、"
+            "不要整段复述卡片、不要说「已发送」，也不要编造工具没给到的信息。"
         ),
     }
     # 放在最后：返回给模型时可能被长度裁剪，前面的信息不能先被挤掉。
