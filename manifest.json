@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "cn.ucbk.video",
   "name": "视频解析",
-  "version": "1.4.0",
-  "description": "群里贴抖音、B站、小红书、快手、今日头条、微博、皮皮搞笑、皮皮虾、即梦、豆包链接，机器人先回一条描述卡片（标题、作者、时长、点赞等互动数据、作品简介），紧接着把视频发回群里；只有 QQ 拒收（体积过大、格式不支持）时才补一条无水印直链。默认不限时长。\n\n用法：\n1. 默认「粘贴链接即解析」，消息里带链接就会处理，不需要 @ 机器人；\n2. 也可以改成「仅指令触发」，此时要发「解析 + 链接」；\n3. 抖音图文作品发送全部原图（按每批 3 张分开发送），实况作品还会补发那段短视频；抖音取 video.bit_rate 多档码率、B站取 html5 单文件 mp4（自带音轨，无需 ffmpeg 合流）、小红书取多条码流，清晰度可在配置里选（1080P / 720P / 480P / 360P），默认自动最高；\n4. 抖音分享页前两次可能只回空壳页面，插件会自动重试三次；\n5. 小红书与微博网页端需登录 Cookie 才能解析（微博必填）；快手遇到风控时可填 Cookie；\n6. 抖音触发风控时，在插件配置里填抖音 Cookie 可显著提高成功率；B站 Cookie 用于解锁更高清晰度；\n7. 同一条链接在缓存有效期内重复粘贴时直接复用结果，不再请求平台；\n8. 触发方式可以选「交给 AI 处理」：插件不抢消息，全部交给 AI 管线，模型看到链接会调「视频发布」工具解析，视频跟它的回复一起发出，中间还过接话判断与发送前审核；\n9. 机器人开启「插件工具」能力后，AI 会多两个工具：「视频信息」只读标题、作者、时长、互动数据与简介；「视频发布」解析并把视频交给系统，随回复一起发出，不会先回一句话再补一条视频。\n\n所有平台都是自己发请求、自己解析，不经过任何第三方中转服务。",
+  "version": "1.5.0",
+  "description": "视频解析作为 AI 工具提供。群里贴抖音、B站、小红书、快手、今日头条、微博、皮皮搞笑、皮皮虾、即梦或豆包的分享链接时，由 AI 调用 parse_video_link 读取标题、作者、时长、互动数据与简介，再按人设组织回复；视频或原图由系统紧跟回复一起发出。插件不监听消息、不抢占消息、不主动发卡片，也不会在群里补直链。\n\n用法：\n1. 安装并启用本插件并批准「访问外网」能力，机器人需开启 AI 回复；\n2. 群里贴链接即可，AI 会自行判断并调用工具；运行记录的 Agent 调用步骤里能看到这次插件调用；\n3. 抖音取 video.bit_rate 多档码率、B站取 html5 单文件 mp4、小红书取多条码流，清晰度可选 1080P / 720P / 480P / 360P，默认自动最高；\n4. 小红书与微博网页端需要登录 Cookie；抖音、快手遇到风控时可填 Cookie；\n5. 同一条链接在缓存有效期内重复提问时直接复用结果，不再请求平台。\n\n所有平台都是自己发请求、自己解析，不经过任何第三方中转服务。",
   "author": {
     "name": "UCBK",
     "url": "https://www.ucbk.cn"
@@ -12,9 +12,7 @@
   "homepage": "https://www.ucbk.cn",
   "entry": "plugin.py",
   "capabilities": [
-    "msg.send",
-    "http.outbound",
-    "llm.generate"
+    "http.outbound"
   ],
   "allowed_domains": [
     "api.amemv.com",
@@ -40,45 +38,14 @@
   ],
   "config_schema": [
     {
-      "key": "reply_scope",
-      "label": "生效范围",
-      "type": "select",
-      "required": false,
-      "sensitive": false,
-      "options": [
-        "群聊与私聊",
-        "仅群聊",
-        "仅私聊"
-      ]
-    },
-    {
-      "key": "auto_parse",
-      "label": "触发方式",
-      "type": "select",
-      "required": false,
-      "sensitive": false,
-      "options": [
-        "粘贴链接即解析",
-        "仅指令触发",
-        "交给 AI 处理"
-      ]
-    },
-    {
-      "key": "trigger_words",
-      "label": "指令触发词（英文逗号分隔，仅指令模式生效）",
-      "type": "text",
-      "required": false,
-      "sensitive": false
-    },
-    {
       "key": "send_video",
-      "label": "回复方式",
+      "label": "是否随回复发送视频",
       "type": "select",
       "required": false,
       "sensitive": false,
       "options": [
         "发送视频",
-        "只发链接"
+        "不发送视频"
       ]
     },
     {
@@ -97,14 +64,7 @@
     },
     {
       "key": "max_duration",
-      "label": "直发视频的时长上限（秒，0 或留空为不限时长）",
-      "type": "number",
-      "required": false,
-      "sensitive": false
-    },
-    {
-      "key": "cooldown_seconds",
-      "label": "同一链接重复解析冷却（秒，0 或留空为默认 15，-1 关闭）",
+      "label": "随回复发送视频的时长上限（秒，0 或留空为不限时长）",
       "type": "number",
       "required": false,
       "sensitive": false
@@ -157,26 +117,12 @@
       "type": "password",
       "required": false,
       "sensitive": true
-    },
-    {
-      "key": "ai_summary_enabled",
-      "label": "视频发完后用 AI 补一句评价",
-      "type": "switch",
-      "required": false,
-      "sensitive": false
-    },
-    {
-      "key": "ai_summary_prompt",
-      "label": "AI 评价提示词（留空用内置风格）",
-      "type": "text",
-      "required": false,
-      "sensitive": false
     }
   ],
   "ai_tools": [
     {
       "name": "parse_video_link",
-      "description": "当用户消息里出现抖音、B站、小红书、快手、今日头条、微博、皮皮搞笑、皮皮虾、即梦或豆包的视频分享链接，且你需要知道这条视频讲什么时调用。传入链接或含链接的原文，返回标题、作者、时长、互动数据、简介和可直接引用的描述卡片文本。本工具只返回信息、不发送任何消息；描述卡片与视频由插件自动发到会话里，回复时不要重复贴链接或整段复述卡片。",
+      "description": "当消息里出现抖音、B站、小红书、快手、今日头条、微博、皮皮搞笑、皮皮虾、即梦或豆包的视频分享链接时，必须先调用本工具读取真实信息，再组织回复。传入链接或含链接的原文，返回标题、作者、时长、互动数据、简介和描述卡片文本。工具只返回信息，视频与图片由系统随你的回复一起发出；回复里不要重复贴链接或整段复述卡片，也不要凭空猜测作品内容。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -185,26 +131,12 @@
             "description": "视频分享链接，也可以直接粘贴包含链接的用户原文"
           }
         },
-        "required": ["url"]
+        "required": [
+          "url"
+        ]
       },
-      "timeout": 20,
-      "result_limit": 2400
-    },
-    {
-      "name": "send_video",
-      "description": "用户贴了抖音、B站、小红书、快手、今日头条、微博、皮皮搞笑、皮皮虾、即梦或豆包的链接，且希望把视频或图文发到会话里时调用。传入链接，插件解析后把媒体交给系统，随你这次回复一起发出，不需要你另外说「马上发给你」。返回值里有标题、作者、时长、互动数据和简介，用它来写回复；不要重复贴链接，也不要整段复述卡片。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "url": {
-            "type": "string",
-            "description": "视频分享链接，也可以直接粘贴包含链接的用户原文"
-          }
-        },
-        "required": ["url"]
-      },
-      "timeout": 90,
-      "result_limit": 2400
+      "timeout": 45,
+      "result_limit": 3200
     }
   ]
 }
