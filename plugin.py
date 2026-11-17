@@ -161,20 +161,61 @@ async def _dispatch_parse(
     )
 
 
+def _caption_for(host: Any, media: dict[str, Any]) -> str:
+    """按配置拼随视频发送的文案。
+
+    - 完整卡片：标题、作者、时长、画质、互动数据一行/多行排好，
+      跟群里常见的那种「【抖音】标题 @作者 · 时长 · 画质 · 点赞」一致；
+    - 仅标题：只发标题一行；
+    - 不发文案：空串，宿主只发媒体。
+
+    图文作品（kind=images）不适用：图片本身带说明，发 caption 反而重复。
+    """
+    if str(media.get("kind") or "") == "images":
+        return ""
+    choice = _choice(host, "caption_format", "完整卡片（标题、作者、时长、画质、互动数据）")
+    if "不发文案" in choice:
+        return ""
+    title = common.flatten(media.get("title"))
+    title_text = common.clip(title, MAX_TITLE_LENGTH) or "未命名作品"
+    if "仅标题" in choice:
+        return title_text
+
+    platform = str(media.get("platform_name") or "")
+    head = f"【{platform}】{title_text}" if platform else title_text
+    parts: list[str] = []
+    if media.get("author"):
+        parts.append(f"@{media['author']}")
+    duration = common.format_duration(media.get("duration"))
+    if duration:
+        parts.append(f"时长 {duration}")
+    if media.get("quality"):
+        parts.append(str(media["quality"]))
+    for item in media.get("stats") or []:
+        if item:
+            parts.append(str(item))
+    return "\n".join(item for item in [head, " · ".join(parts)] if item)
+
+
 def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     """把作品里的视频/图片转成宿主待发队列条目。
 
     宿主会在 AI 正文发出之后逐条补发这些媒体；发不出来就只记日志，不再补
-    直链，也不会改变已经发出的正文。
+    直链，也不会改变已经发出的正文。视频条目带 ``caption`` 时，宿主会把
+    文案与视频合并成同一条消息发出，在群里渲染成卡片样式。
     """
     items: list[dict[str, Any]] = []
+    caption = _caption_for(host, media)
     if str(media.get("kind") or "") == "images":
         for url in (media.get("images") or [])[:MAX_IMAGE_ATTACHMENTS]:
             if url:
                 items.append({"type": "image", "file": str(url)})
         live = common.text_of(media.get("live_video_url"))
         if live:
-            items.append({"type": "video", "file": live})
+            video_item: dict[str, Any] = {"type": "video", "file": live}
+            if caption:
+                video_item["caption"] = caption
+            items.append(video_item)
         return items
 
     # 旧版本装过来的配置可能还留着「只发链接」，按「不发送媒体」处理。
@@ -189,6 +230,8 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     if not play_url:
         return items
     item: dict[str, Any] = {"type": "video", "file": play_url}
+    if caption:
+        item["caption"] = caption
     mirror = str(media.get("play_url_mirror") or "")
     if mirror and mirror != play_url:
         item["fallbacks"] = [mirror]
