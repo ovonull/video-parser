@@ -219,22 +219,20 @@ def _attachments(
     - 发送视频：视频地址交给宿主上传/回源，群里是可播放的视频；
     - 发送无水印直链：不传文件，只把平台的去水印地址当文本发出去。
 
-    「是否合并发送」打开时文案与视频/链接合成一条消息（群聊里渲染成卡片）；
-    关闭时文案单独先发一条，媒体跟在后面。
+    文案挂在视频条目上（``caption``），由宿主决定怎么发：接入端要求视频段独占
+    一条消息，宿主会把文案拆成前一条文字、视频单独一条；直链模式本身就是文本，
+    文案和链接走同一条。
     """
     items: list[dict[str, Any]] = []
     caption = _caption_for(host, media)
-    merged = _switch_config(host, "merge_caption", True)
     if str(media.get("kind") or "") == "images":
         for url in (media.get("images") or [])[:MAX_IMAGE_ATTACHMENTS]:
             if url:
                 items.append({"type": "image", "file": str(url)})
         live = common.text_of(media.get("live_video_url"))
         if live:
-            if caption and not merged:
-                items.append({"type": "text", "text": caption})
             video_item: dict[str, Any] = {"type": "video", "file": live}
-            if caption and merged:
+            if caption:
                 video_item["caption"] = caption
             items.append(video_item)
         return items, "" if items else "图文作品没有取到图片地址"
@@ -252,25 +250,17 @@ def _attachments(
 
     style = _choice(host, "reply_style", "发送视频")
     host.log(
-        f"随回复发送媒体：样式={style} 合并={'是' if merged else '否'} "
-        f"文案={'有' if caption else '无'} 时长={duration or '未知'} 秒 "
-        f"上限={limit or '不限'}"
+        f"随回复发送媒体：样式={style} 文案={'有' if caption else '无'} "
+        f"时长={duration or '未知'} 秒 上限={limit or '不限'}"
     )
     if "直链" in style:
-        if not caption:
-            items.append({"type": "text", "text": play_url})
-        elif merged:
-            items.append({"type": "text", "text": f"{caption}\n{play_url}"})
-        else:
-            items.append({"type": "text", "text": caption})
-            items.append({"type": "text", "text": play_url})
+        # 直链本身就是文本，文案和链接放同一条，不会因为段结构被拒。
+        text = f"{caption}\n{play_url}" if caption else play_url
+        items.append({"type": "text", "text": text})
         return items, ""
 
-    if caption and not merged:
-        # 不合并：文案先单独发，视频跟在后面，顺序与直链模式一致。
-        items.append({"type": "text", "text": caption})
     item: dict[str, Any] = {"type": "video", "file": play_url}
-    if caption and merged:
+    if caption:
         item["caption"] = caption
     mirror = str(media.get("play_url_mirror") or "")
     if mirror and mirror != play_url:
