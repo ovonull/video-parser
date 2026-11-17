@@ -203,8 +203,14 @@ def _caption_for(host: Any, media: dict[str, Any]) -> str:
     return "\n".join(item for item in [head, " · ".join(parts)] if item)
 
 
-def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
+def _attachments(
+    host: Any, media: dict[str, Any]
+) -> tuple[list[dict[str, Any]], str]:
     """把作品里的视频/图片转成宿主待发队列条目。
+
+    返回 ``(条目, 跳过原因)``：有媒体时原因为空串；跳过时原因是一句能直接看懂
+    的中文，会随工具结果一起回给模型，也会出现在运行记录的调用步骤里——
+    排查「怎么只回了一句话、视频没到」时不用再翻服务端日志。
 
     宿主会在 AI 正文发出之后逐条补发这些媒体；发不出来就只记日志，不再补
     直链，也不会改变已经发出的正文。
@@ -231,17 +237,26 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
             if caption and merged:
                 video_item["caption"] = caption
             items.append(video_item)
-        return items
+        return items, "" if items else "图文作品没有取到图片地址"
 
     limit = _int_config(host, "max_duration", 0, 0, MAX_DURATION_LIMIT)
     duration = media.get("duration") or 0
     if limit and duration and duration > limit:
-        return items
+        reason = f"时长 {duration} 秒超过上限 {limit} 秒"
+        host.log(f"不发送视频：{reason}")
+        return items, reason
     play_url = str(media.get("play_url") or "")
     if not play_url:
-        return items
+        host.log("不发送视频：没有解析到播放地址")
+        return items, "没有解析到播放地址"
 
-    if "直链" in _choice(host, "reply_style", "发送视频"):
+    style = _choice(host, "reply_style", "发送视频")
+    host.log(
+        f"随回复发送媒体：样式={style} 合并={'是' if merged else '否'} "
+        f"文案={'有' if caption else '无'} 时长={duration or '未知'} 秒 "
+        f"上限={limit or '不限'}"
+    )
+    if "直链" in style:
         if not caption:
             items.append({"type": "text", "text": play_url})
         elif merged:
@@ -249,7 +264,7 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             items.append({"type": "text", "text": caption})
             items.append({"type": "text", "text": play_url})
-        return items
+        return items, ""
 
     if caption and not merged:
         # 不合并：文案先单独发，视频跟在后面，顺序与直链模式一致。
@@ -261,12 +276,36 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     if mirror and mirror != play_url:
         item["fallbacks"] = [mirror]
     items.append(item)
-    return items
+    return items, ""
 
 
 def _tool_error(message: str) -> dict[str, Any]:
     """工具失败时回一段模型读得懂的中文说明，不把异常抛给对话循环。"""
     return {"ok": False, "error": message}
+
+
+def _hint(has_media: bool) -> str:
+    """给模型的提示：这一轮有没有排队媒体，说法不一样。
+
+    没排上媒体还按「已发送」的口吻回复，群里就会出现「视频发你了」但什么都
+    没到的情况，所以要把结论直接写进提示里。
+    """
+    head = "作品信息以 card 为准，card 里的「作品原文」是发布者写的完整文案；"
+    tail = (
+        "可以引用原文里的原话，但不要贴链接、不要整段照抄卡片、"
+        "也不要编造工具没给到的信息。"
+    )
+    if has_media:
+        return (
+            head
+            + "视频或图片已排队，会由系统紧跟着你的回复发出。请按你的人设自然接话，"
+            + tail
+        )
+    return (
+        head
+        + "这次没有随回复发送视频或图片，不要说「已发送」「看视频」这类话，只谈作品内容。"
+        + tail
+    )
 
 
 def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
@@ -276,6 +315,9 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
     也有「作品原文」整段（含被当作标题的那一行），再单独塞一份 ``desc`` 只是
     重复占上下文。模型能读到原话，但 ``hint`` 仍要求它不要整段照抄。
     """
+    # 放在最后：返回给模型时可能被长度裁剪，前面的信息不能先被挤掉。
+    # 宿主在裁剪前就取走这一项登记待发媒体，模型不需要看到这些地址。
+    attachments, skipped = _attachments(host, media)
     payload: dict[str, Any] = {
         "ok": True,
         "platform": str(media.get("platform_name") or ""),
@@ -287,18 +329,13 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
         "kind": str(media.get("kind") or ""),
         "image_count": len(media.get("images") or []),
         "card": _describe(media),
-        "hint": (
-            "作品信息以 card 为准，card 里的「作品原文」是发布者写的完整文案；"
-            "视频或图片已排队，会由系统紧跟着你的回复发出。请按你的人设自然接话，"
-            "可以引用原文里的原话，但不要贴链接、不要整段照抄卡片、不要说「已发送」，"
-            "也不要编造工具没给到的信息。"
-        ),
+        "hint": _hint(bool(attachments)),
     }
-    # 放在最后：返回给模型时可能被长度裁剪，前面的信息不能先被挤掉。
-    # 宿主在裁剪前就取走这一项登记待发媒体，模型不需要看到这些地址。
-    attachments = _attachments(host, media)
     if attachments:
         payload["attachments"] = attachments
+    elif skipped:
+        # 顺手回给模型和运行记录：没发视频是因为什么，一眼能看懂。
+        payload["media_skipped"] = skipped
     return payload
 
 
