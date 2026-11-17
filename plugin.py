@@ -286,8 +286,12 @@ def _attachments(
         f"时长={duration or '未知'} 秒 上限={limit or '不限'}"
     )
     if "直链" in style:
+        # 详情接口的码率地址带 Referer 防盗链，群里裸链点开是 403。抖音会给
+        # share_url（302 播放端点的原片地址：无水印、画质最高、点开即播），优先用它；
+        # 其它平台或拿不到 vid 时退回 play_url。
+        link = str(media.get("share_url") or "") or play_url
         # 直链本身就是文本，文案和链接放同一条，不会因为段结构被拒。
-        text = f"{caption}\n{play_url}" if caption else play_url
+        text = f"{caption}\n{link}" if caption else link
         items.append({"type": "text", "text": text})
         return items, ""
 

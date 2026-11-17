@@ -10,9 +10,13 @@
 - 多档码率在 `video.bitRateList`（详情接口）或 `video.bit_rate`（分享页）里，
   **按 bitRate 降序**才是真实画质顺序，`quality_type` 只是编号；
 - 每档可能有多个 CDN 地址，优先用 v3-web，v26-web 换成对应域名；
-- 只发码率档里的无水印地址（playwm→play），不再走 vid 302 原画：那条路拿到
-  的是发布者原始上传文件，可能自带水印、体积动辄上 GB，既不是去水印也过不了
-  发送上限；按码率与时长估算每档体积，自动避开发不出去的大档。
+- 发视频按码率与时长估算每档体积，在预算内选最高档，避免大档超宿主转存上限；
+  原片是发布者原始上传文件，本身无水印、画质最高，但体积动辄 1GB，发视频会超
+  转存上限，所以「发送视频」样式走码率档；
+- 详情接口的码率地址带 Referer 防盗链，裸链点开是 403。「无水印直链」样式用
+  302 播放端点（share_url）：不校验 Referer、点开实时跳到带时效 CDN 地址（裸链
+  200），ratio=default 取发布者原片（约 1GB、无水印、画质最高）；直链点开边下
+  边播，不受宿主转存上限限制，所以能发原画。
 
 图文作品：发全部原图，与视频走同一套描述卡片。
 """
@@ -22,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from urllib.parse import urlencode
 from typing import Any
 
 from vparse import common
@@ -42,6 +47,11 @@ RETRY_GAP = 0.3
 
 # 抖音码率档位编号对应的视频高度，取自 bit_rate[].quality_type。
 QUALITY_TYPE_HEIGHT = {32: 540, 54: 720, 80: 1080}
+
+# 群里可点开的无水印原画直链：302 播放端点不校验 Referer，点开时实时跳到带
+# 时效的 CDN 地址（裸链 200）。ratio=default 取发布者原片——原片本身无水印、
+# 画质最高，直链点开边下边播不受宿主转存上限限制，所以直链样式固定发原画。
+PLAY_API = "https://aweme.snssdk.com/aweme/v1/play/"
 
 # 作品节点里的互动数据，字段 → 展示标签。
 STAT_PAIRS: tuple[tuple[Any, str], ...] = (
@@ -146,6 +156,34 @@ def _prefer_host(urls: list[str]) -> str:
         if url:
             return url
     return ""
+
+
+def _video_vid(video: dict[str, Any]) -> str:
+    """取作品的 vid（play_addr.uri），302 播放端点要用它定位文件。"""
+    nodes: list[Any] = [video.get("play_addr"), video]
+    play_addr = video.get("playAddr")
+    if isinstance(play_addr, list) and play_addr:
+        nodes.insert(0, play_addr[0])
+    for node in nodes:
+        if isinstance(node, dict):
+            vid = common.text_of(node.get("uri"))
+            if vid:
+                return vid
+    return ""
+
+
+def _share_url(vid: str) -> str:
+    """
+    生成群里点开即可播放的无水印原画直链。
+
+    详情接口的码率地址带 Referer 防盗链，裸链点开是 403；改用 302 播放端点：
+    不带 Referer 也能跳，点开时实时 302 到带时效的 CDN 地址（裸链 200），所以
+    直链长期有效。ratio=default 取发布者原片：原片本身无水印、画质最高（实测
+    约 1GB），直链点开边下边播、不受宿主转存上限限制，能放心发原画。
+    """
+    if not vid:
+        return ""
+    return f"{PLAY_API}?{urlencode({'video_id': vid, 'ratio': 'default', 'line': '0'})}"
 
 
 def _host_key(url: str) -> str:
@@ -462,6 +500,11 @@ def _build(
     media["play_url"] = url
     if mirrors:
         media["play_url_mirrors"] = mirrors
+    # 群里直链样式用：302 端点给的无水印原画地址，点开时实时跳转，裸链可播。
+    # 拿不到 vid（少数作品）时留空，插件会退回用 play_url 发直链。
+    share = _share_url(_video_vid(video))
+    if share:
+        media["share_url"] = share
     label = label or (f"{height}P" if height else "")
     if label:
         media["quality"] = label
