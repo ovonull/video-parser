@@ -295,25 +295,33 @@ def _attachments(
         items.append({"type": "text", "text": text})
         return items, ""
 
-    item: dict[str, Any] = {"type": "video", "file": play_url}
+    # 抖音有 302 原画端点（share_url）：发布者原片，无水印、画质最高。发送视频
+    # 也优先发原画，码率档降为备用——原画点开即播不受大小限制，但「发送视频」
+    # 是宿主先转存再发，1GB 原画下载慢，超时/失败时宿主会接着试下面的码率档，
+    # 保证视频还能发出去，而不是只剩一句文字。其它平台没有这个端点，仍用 play_url。
+    share = str(media.get("share_url") or "")
+    primary = share or play_url
+    item: dict[str, Any] = {"type": "video", "file": primary}
     if caption:
         item["caption"] = caption
         if _switch_config(host, "merge_caption", False):
             # 交给宿主装进合并转发卡片；接入端不认视频节点时宿主会自己拆开。
             item["forward"] = True
-    # 同一档位的其它 CDN 域名作为备用：主地址被防盗链拒绝（403/fetch failed）
-    # 时宿主会逐个转存重试。v3-web 失效、v26-web 可用的情况实测存在，多域名
-    # 兜底比挑一个域名可靠。兼容旧的单个 play_url_mirror 字段。
-    mirrors: list[str] = []
+    # 备用地址：原画失败时退码率档；码率档自身还有同档 CDN 域名镜像可逐个重试。
+    # 主地址被防盗链拒绝（403/fetch failed）或下载超时，宿主会按顺序转存重试。
+    fallbacks: list[str] = []
+    if share:
+        # 原画为主时，码率档整档（含镜像）都是备用。
+        fallbacks.append(play_url)
     for candidate in (
         *(media.get("play_url_mirrors") or []),
         media.get("play_url_mirror"),
     ):
         text = str(candidate or "")
-        if text and text != play_url and text not in mirrors:
-            mirrors.append(text)
-    if mirrors:
-        item["fallbacks"] = mirrors
+        if text and text != primary and text not in fallbacks:
+            fallbacks.append(text)
+    if fallbacks:
+        item["fallbacks"] = fallbacks
     items.append(item)
     return items, ""
 
