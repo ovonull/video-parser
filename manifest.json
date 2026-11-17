@@ -51,6 +51,15 @@
       "description": "发送视频：随回复发出可播放的视频文件；发送无水印直链：只发一条文本，不带文件。"
     },
     {
+      "key": "merge_caption",
+      "label": "是否合并发送",
+      "type": "switch",
+      "required": false,
+      "sensitive": false,
+      "default": false,
+      "description": "开启后文案和视频装进一张聊天记录卡片，点开才能看视频；部分接入端会显示「视频已过期」，遇到就关掉。关闭时是文案一条、视频一条。"
+    },
+    {
       "key": "send_caption",
       "label": "是否发送抖音文案",
       "type": "switch",

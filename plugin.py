@@ -219,9 +219,11 @@ def _attachments(
     - 发送视频：视频地址交给宿主上传/回源，群里是可播放的视频；
     - 发送无水印直链：不传文件，只把平台的去水印地址当文本发出去。
 
-    文案挂在视频条目上（``caption``），由宿主决定怎么发：接入端要求视频段独占
-    一条消息，宿主会把文案拆成前一条文字、视频单独一条；直链模式本身就是文本，
-    文案和链接走同一条。
+    文案挂在视频条目上（``caption``），由宿主决定怎么发：
+    - 合并发送打开：文案和视频装进一张聊天记录卡片，群里是「查看 2 条转发消息」；
+      接入端不支持时宿主会自动退回两条；
+    - 合并发送关闭：文案一条、视频一条，挨着发。
+    直链模式本身就是文本，文案和链接走同一条。
     """
     items: list[dict[str, Any]] = []
     caption = _caption_for(host, media)
@@ -251,6 +253,7 @@ def _attachments(
     style = _choice(host, "reply_style", "发送视频")
     host.log(
         f"随回复发送媒体：样式={style} 文案={'有' if caption else '无'} "
+        f"合并={'是' if _switch_config(host, 'merge_caption', False) else '否'} "
         f"时长={duration or '未知'} 秒 上限={limit or '不限'}"
     )
     if "直链" in style:
@@ -262,6 +265,9 @@ def _attachments(
     item: dict[str, Any] = {"type": "video", "file": play_url}
     if caption:
         item["caption"] = caption
+        if _switch_config(host, "merge_caption", False):
+            # 交给宿主装进合并转发卡片；接入端不认视频节点时宿主会自己拆开。
+            item["forward"] = True
     mirror = str(media.get("play_url_mirror") or "")
     if mirror and mirror != play_url:
         item["fallbacks"] = [mirror]
