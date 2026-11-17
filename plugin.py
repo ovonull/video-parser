@@ -90,6 +90,31 @@ def _seconds_config(host: Any, key: str, default: int, high: int) -> int:
     return min(value, high)
 
 
+# 抖音单视频体积预算默认值（MB）。宿主转存上限默认 100MB，这里留出余量，
+# 让「无水印 + 发得出去」同时成立：短视频照发高码率档，长视频自动降到有余量
+# 的档；估算有偏差时也不会顶到上限。用户可调大此值配合宿主上限发更高清。
+DEFAULT_VIDEO_BUDGET_MB = 90
+MAX_VIDEO_BUDGET_MB = 4096
+
+
+def _video_budget_bytes(host: Any) -> int:
+    """读取单视频体积预算并换算成字节；0 或空表示用默认值，-1 表示不限。"""
+    raw = host.config.get("video_max_mb")
+    if raw is None or str(raw).strip() == "":
+        mb = DEFAULT_VIDEO_BUDGET_MB
+    else:
+        try:
+            mb = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            mb = DEFAULT_VIDEO_BUDGET_MB
+        if mb == -1:
+            return 0
+        if mb < 0:
+            mb = DEFAULT_VIDEO_BUDGET_MB
+        mb = min(mb, MAX_VIDEO_BUDGET_MB)
+    return mb * 1024 * 1024
+
+
 def _describe(media: dict[str, Any]) -> str:
     """拼描述卡片：标题、元信息、互动数据，以及发布者写的完整原文。
 
@@ -134,7 +159,11 @@ async def _dispatch_parse(
     """按平台调用对应解析器。"""
     if platform == "douyin":
         return await douyin.parse(
-            url, _text_config(host, "douyin_cookie", ""), host, quality
+            url,
+            _text_config(host, "douyin_cookie", ""),
+            host,
+            quality,
+            _video_budget_bytes(host),
         )
     if platform == "bilibili":
         return await bilibili.parse(
@@ -268,9 +297,19 @@ def _attachments(
         if _switch_config(host, "merge_caption", False):
             # 交给宿主装进合并转发卡片；接入端不认视频节点时宿主会自己拆开。
             item["forward"] = True
-    mirror = str(media.get("play_url_mirror") or "")
-    if mirror and mirror != play_url:
-        item["fallbacks"] = [mirror]
+    # 同一档位的其它 CDN 域名作为备用：主地址被防盗链拒绝（403/fetch failed）
+    # 时宿主会逐个转存重试。v3-web 失效、v26-web 可用的情况实测存在，多域名
+    # 兜底比挑一个域名可靠。兼容旧的单个 play_url_mirror 字段。
+    mirrors: list[str] = []
+    for candidate in (
+        *(media.get("play_url_mirrors") or []),
+        media.get("play_url_mirror"),
+    ):
+        text = str(candidate or "")
+        if text and text != play_url and text not in mirrors:
+            mirrors.append(text)
+    if mirrors:
+        item["fallbacks"] = mirrors
     items.append(item)
     return items, ""
 
@@ -354,7 +393,9 @@ async def tool_parse_video_link(
         cache_seconds = _seconds_config(
             host, "cache_seconds", DEFAULT_CACHE_SECONDS, MAX_CACHE_SECONDS
         )
-        cache_key = f"{platform}:{url}:{quality}"
+        # 预算参与缓存键：改了体积上限后，同一链接要重新按新预算选档。
+        budget = _video_budget_bytes(host)
+        cache_key = f"{platform}:{url}:{quality}:{budget}"
         media = _media_cache.get(cache_key) if cache_seconds else None
         if media is None:
             host.log(f"解析视频链接：{common.clip(url, 80)}")

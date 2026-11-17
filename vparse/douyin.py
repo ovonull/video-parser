@@ -10,7 +10,9 @@
 - 多档码率在 `video.bitRateList`（详情接口）或 `video.bit_rate`（分享页）里，
   **按 bitRate 降序**才是真实画质顺序，`quality_type` 只是编号；
 - 每档可能有多个 CDN 地址，优先用 v3-web，v26-web 换成对应域名；
-- 想要真正的「原画」，用 `play_addr.uri`（vid）拼地址再跟 302 取最终文件。
+- 只发码率档里的无水印地址（playwm→play），不再走 vid 302 原画：那条路拿到
+  的是发布者原始上传文件，可能自带水印、体积动辄上 GB，既不是去水印也过不了
+  发送上限；按码率与时长估算每档体积，自动避开发不出去的大档。
 
 图文作品：发全部原图，与视频走同一套描述卡片。
 """
@@ -22,8 +24,6 @@ import json
 import re
 from typing import Any
 
-from app.services.plugin_sdk import PluginCallError
-
 from vparse import common
 from vparse.common import VideoParseError
 
@@ -33,8 +33,6 @@ ROUTER_MARK = "window._ROUTER_DATA"
 
 # 免 Cookie 详情接口：比分享页稳，不用等空壳页面重试。
 DETAIL_API = "https://api.amemv.com/aweme/v1/aweme/detail/"
-# 原画直链入口：带上 vid 后 302 跳到真正的无水印文件。
-ORIGINAL_PLAY_API = "https://aweme.snssdk.com/aweme/v1/play/"
 
 # 分享页体积约 32KB，关键数据在第 3 万字符之后，必须申请更大的响应长度。
 SHARE_PAGE_CHARS = 120000
@@ -139,100 +137,130 @@ def _prefer_host(urls: list[str]) -> str:
     """
     在候选地址里挑一个最稳的。
 
-    抖音会给出不同 CDN 域名的同一份文件：v3-web 最稳，v26-web 需要换成对应域名。
+    同一份文件会有不同 CDN 域名（v3-web、v26-web 等），它们的可用性随时间和
+    地区变化，实测出现过 v3-web 全部 403、而 v26-web 正常返回的情况。因此这里
+    **保留平台给的原始域名，不再把 v26-web 改写成 v3-web**——改写会把本来能用
+    的地址改坏。其它域名通过镜像地址交给宿主做失败重试。
     """
-    v3 = ""
-    v26 = ""
     for url in urls:
-        if "v3-web" in url:
-            v3 = url
-            break
-        if not v26 and "v26-web" in url:
-            v26 = url
-    if v3:
-        return v3
-    if v26:
-        return v26.replace("v26-web", "v3-web")
-    return urls[0] if urls else ""
+        if url:
+            return url
+    return ""
 
 
-def _video_candidates(video: dict[str, Any]) -> list[tuple[int, int, str, str]]:
+def _host_key(url: str) -> str:
+    """按 hostname 去重：同一域名的多条地址只保留一条。"""
+    try:
+        from urllib.parse import urlparse
+
+        return (urlparse(url).hostname or url).lower()
+    except ValueError:
+        return url
+
+
+def _rate_mirrors(rate: dict[str, Any], primary: str) -> list[str]:
     """
-    收集视频的可用清晰度，返回 (高度, 码率, 展示名称, 地址)。
+    取同一档里与主地址不同域名的其它地址，作为失败重试的备用。
 
-    play_addr / download_addr 作为兜底地址附在末尾，高度与码率都记 0。
+    抖音码率档的播放路径在各 CDN 域名间通用（同一 path 换前缀即可取到同一
+    文件），而域名可用性随时间变化：实测 v3-web 全部 403、v26-web 却正常。
+    因此除了接口给的原始域名，再补一个 v26-web 变体兜底，避免接口只返回单
+    一失效域名时无地址可换。
     """
-    candidates: list[tuple[int, int, str, str]] = []
+    seen = {_host_key(primary)}
+    mirrors: list[str] = []
+    for url in _rate_addresses(rate):
+        url = _clean_play_url(common.https_url(url))
+        key = _host_key(url)
+        if url and key not in seen:
+            seen.add(key)
+            mirrors.append(url)
+
+    # 同 path 换 v26-web 前缀：v3-web 失效时的可靠备用。
+    if "douyinvod.com" in seen or "v3-web" in primary:
+        variant = re.sub(
+            r"^(https?://)[^/]*", r"\1v26-web.douyinvod.com", primary, count=1
+        )
+        key = _host_key(variant)
+        if variant != primary and key not in seen:
+            seen.add(key)
+            mirrors.append(variant)
+    return mirrors
+
+
+def _video_candidates(
+    video: dict[str, Any]
+) -> list[tuple[int, int, str, str, list[str]]]:
+    """
+    收集视频的可用清晰度，返回 (高度, 码率, 展示名称, 地址, 镜像地址列表)。
+
+    镜像地址是同一档位的其它 CDN 域名：主地址被防盗链拒绝时，宿主按镜像逐个
+    重试。play_addr / download_addr 作为兜底地址附在末尾，高度与码率都记 0。
+    """
+    candidates: list[tuple[int, int, str, str, list[str]]] = []
     for rate in sorted(_bit_rate_list(video), key=_rate_bitrate, reverse=True):
-        url = _prefer_host(_rate_addresses(rate))
+        raw_urls = _rate_addresses(rate)
+        url = _prefer_host(raw_urls)
         if not url:
             continue
+        url = _clean_play_url(common.https_url(url))
         height = QUALITY_TYPE_HEIGHT.get(_int_of(rate.get("quality_type")), 0)
         label = common.text_of(rate.get("gearName") or rate.get("gear_name"))
         if not label:
             label = f"{height}P" if height else ""
-        candidates.append((height, _rate_bitrate(rate), label, _clean_play_url(url)))
+        mirrors = [m for m in _rate_mirrors(rate, url) if m != url]
+        candidates.append((height, _rate_bitrate(rate), label, url, mirrors))
 
     fallback = _clean_play_url(common.first_url(video.get("play_addr"))) or _clean_play_url(
         common.first_url(video.get("download_addr"))
     )
     if fallback:
-        candidates.append((0, 0, "", fallback))
+        candidates.append((0, 0, "", fallback, []))
     return candidates
 
 
 def _pick_video(
-    candidates: list[tuple[int, int, str, str]], wanted: int | None
-) -> tuple[int, int, str, str] | None:
+    candidates: list[tuple[int, int, str, str, list[str]]],
+    wanted: int | None,
+    duration_ms: int = 0,
+    budget_bytes: int = 0,
+) -> tuple[int, int, str, str, list[str]] | None:
     """
-    在候选里选一档。
+    在候选里选一档无水印码率地址。
 
-    规则：选不超过目标高度的最高档（同一高度里取码率最大的）；
-    「自动最高」直接取码率最大的一档，即抖音画质最好的一档。
+    规则：
+    - 先按目标高度筛出候选池（「自动最高」取码率最大的一档）；
+    - 再用体积预算收敛：按 ``码率 × 时长`` 估算每档大小，预算内取码率最大的；
+      全部超预算时退到估算体积最小的一档，宁可降清晰度也要保证能发出去；
+    - 码率或时长缺失、预算为 0 时跳过体积过滤，沿用清晰度规则。
     """
     if not candidates:
         return None
     if wanted is None:
-        return max(candidates, key=lambda item: item[1])
-    fitted = [item for item in candidates if 0 < item[0] <= wanted]
-    if fitted:
-        return max(fitted, key=lambda item: item[1])
-    known = [item for item in candidates if item[0] > 0]
-    if known:
-        return min(known, key=lambda item: item[0])
-    return candidates[0]
+        pool = list(candidates)
+    else:
+        pool = [item for item in candidates if 0 < item[0] <= wanted]
+        if not pool:
+            known = [item for item in candidates if item[0] > 0]
+            pool = list(known) if known else list(candidates)
 
+    if budget_bytes > 0 and duration_ms > 0:
+        # 码率单位是 bit/s，时长是 ms：字节 ≈ bitrate × duration_ms / 1000 / 8。
+        def estimated(item: tuple[int, int, str, str, list[str]]) -> int:
+            bitrate = item[1]
+            return bitrate * duration_ms // 8000 if bitrate > 0 else 0
 
-def _video_vid(video: dict[str, Any]) -> str:
-    """取视频的 vid，原画直链要用它拼地址。"""
-    nodes: list[Any] = [video.get("play_addr"), video]
-    play_addr = video.get("playAddr")
-    if isinstance(play_addr, list) and play_addr:
-        nodes.insert(0, play_addr[0])
-    for node in nodes:
-        if isinstance(node, dict):
-            vid = common.text_of(node.get("uri"))
-            if vid:
-                return vid
-    return ""
-
-
-async def _resolve_original_url(vid: str, host: Any) -> str:
-    """
-    vid 拼出的原画地址会 302 跳到真正的文件，这里把 Location 取出来。
-
-    宿主出网不自动跟随重定向，因此这里能直接拿到 302 的 location 头。
-    """
-    if not vid:
-        return ""
-    result = await host.http_request(
-        "GET",
-        ORIGINAL_PLAY_API,
-        headers={"User-Agent": common.DESKTOP_UA, "Referer": "https://www.douyin.com/"},
-        query={"video_id": vid, "ratio": "default", "line": "0"},
-        timeout=8.0,
-    )
-    return common.headers_of(result).get("location") or ""
+        affordable = [item for item in pool if 0 < estimated(item) <= budget_bytes]
+        if affordable:
+            pool = affordable
+        else:
+            # 没有一档落在预算内：退到估算体积最小的档，至少发得出去。
+            sized = [item for item in pool if estimated(item) > 0]
+            if sized:
+                pool = [min(sized, key=estimated)]
+    if wanted is None or any(item[0] > 0 for item in pool):
+        return max(pool, key=lambda item: item[1])
+    return pool[0]
 
 
 def extract_id(text: str) -> str:
@@ -379,7 +407,9 @@ def _live_photo_url(images: list[Any]) -> str:
     return ""
 
 
-def _build(item: dict[str, Any], source_url: str, wanted: int | None) -> dict[str, Any]:
+def _build(
+    item: dict[str, Any], source_url: str, wanted: int | None, budget_bytes: int = 0
+) -> dict[str, Any]:
     """把作品节点转成统一结构，视频与图集分开处理。"""
     video = item.get("video") or {}
     images = item.get("images") or item.get("image_list") or []
@@ -423,13 +453,15 @@ def _build(item: dict[str, Any], source_url: str, wanted: int | None) -> dict[st
             media["live_video_url"] = live
         return media
 
-    picked = _pick_video(_video_candidates(video), wanted)
+    picked = _pick_video(_video_candidates(video), wanted, duration_ms, budget_bytes)
     if picked is None:
         raise VideoParseError(
             "作品里没有找到可播放的地址", "可能是直播回放、合集或受限作品"
         )
-    height, _bitrate, label, url = picked
+    height, _bitrate, label, url, mirrors = picked
     media["play_url"] = url
+    if mirrors:
+        media["play_url_mirrors"] = mirrors
     label = label or (f"{height}P" if height else "")
     if label:
         media["quality"] = label
@@ -437,7 +469,11 @@ def _build(item: dict[str, Any], source_url: str, wanted: int | None) -> dict[st
 
 
 async def parse(
-    url: str, cookie: str, host: Any, quality: str = common.DEFAULT_QUALITY
+    url: str,
+    cookie: str,
+    host: Any,
+    quality: str = common.DEFAULT_QUALITY,
+    budget_bytes: int = 0,
 ) -> dict[str, Any]:
     """
     解析一条抖音链接。
@@ -447,6 +483,7 @@ async def parse(
         cookie: 安装配置里的抖音 Cookie，可为空。
         host: 插件宿主视图。
         quality: 安装配置里的清晰度名称，决定在多档码率里选哪一档。
+        budget_bytes: 单视频体积预算（字节），超过则降档；0 表示不限制。
     Returns:
         统一结构的媒体信息。
     Raises:
@@ -470,17 +507,5 @@ async def parse(
         )
 
     wanted = common.quality_target(quality)
-    media = _build(item, url, wanted)
-
-    # 「自动最高」时再走一次 vid 原画：这是抖音真正的高清直链。
-    if media.get("kind") == "video" and wanted is None:
-        vid = _video_vid(item.get("video") or {})
-        if vid:
-            try:
-                original = await _resolve_original_url(vid, host)
-            except PluginCallError:
-                original = ""
-            if original:
-                media["play_url"] = original
-                media["quality"] = "原画"
+    media = _build(item, url, wanted, budget_bytes)
     return media
