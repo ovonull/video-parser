@@ -203,6 +203,10 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     宿主会在 AI 正文发出之后逐条补发这些媒体；发不出来就只记日志，不再补
     直链，也不会改变已经发出的正文。视频条目带 ``caption`` 时，宿主会把
     文案与视频合并成同一条消息发出，在群里渲染成卡片样式。
+
+    两种发送方式：
+    - 发送视频文件：视频地址交给宿主上传/回源，群里是可播放的视频；
+    - 发送去水印直链：只排一条文本，直链本身是平台的无水印地址。
     """
     items: list[dict[str, Any]] = []
     caption = _caption_for(host, media)
@@ -229,8 +233,21 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     play_url = str(media.get("play_url") or "")
     if not play_url:
         return items
+    # 「发送去水印直链」：不传文件，把直链当文本发出去。
+    send_mode = _choice(host, "video_send_mode", "发送视频文件")
+    if "直链" in send_mode:
+        merged = _choice(host, "merge_caption_video", "合并")
+        if caption and "合并" in merged:
+            items.append({"type": "text", "text": f"{caption}\n{play_url}"})
+        else:
+            # 分开：先发文案（有的话），再发链接；顺序与视频文件模式一致。
+            if caption:
+                items.append({"type": "text", "text": caption})
+            items.append({"type": "text", "text": play_url})
+        return items
     item: dict[str, Any] = {"type": "video", "file": play_url}
-    if caption:
+    merged = _choice(host, "merge_caption_video", "合并")
+    if caption and "合并" in merged:
         item["caption"] = caption
     mirror = str(media.get("play_url_mirror") or "")
     if mirror and mirror != play_url:
