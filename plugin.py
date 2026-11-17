@@ -52,6 +52,16 @@ def _choice(host: Any, key: str, default: str) -> str:
     return _text_config(host, key, default)
 
 
+def _switch_config(host: Any, key: str, default: bool) -> bool:
+    """读取开关型配置；面板存的是布尔值，也兼容手写的 true/on/1。"""
+    raw = host.config.get(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _int_config(host: Any, key: str, default: int, low: int, high: int) -> int:
     """读取数字型配置，非法或越界时回落到默认值。"""
     raw = host.config.get(key)
@@ -162,25 +172,21 @@ async def _dispatch_parse(
 
 
 def _caption_for(host: Any, media: dict[str, Any]) -> str:
-    """按配置拼随视频发送的文案。
+    """拼随视频发送的文案。
 
-    - 完整卡片：标题、作者、时长、画质、互动数据一行/多行排好，
-      跟群里常见的那种「【抖音】标题 @作者 · 时长 · 画质 · 点赞」一致；
-    - 仅标题：只发标题一行；
-    - 不发文案：空串，宿主只发媒体。
+    开关「是否发送抖音文案」打开时发一张卡片：标题、作者、时长、画质、互动
+    数据排成两行，跟群里常见的那种「【抖音】标题 @作者 · 时长 · 画质 · 点赞」
+    一致；关掉就只发媒体，不带任何文字。
 
     图文作品（kind=images）不适用：图片本身带说明，发 caption 反而重复。
     """
     if str(media.get("kind") or "") == "images":
         return ""
-    choice = _choice(host, "caption_format", "完整卡片（标题、作者、时长、画质、互动数据）")
-    if "不发文案" in choice:
+    if not _switch_config(host, "send_caption", True):
         return ""
+
     title = common.flatten(media.get("title"))
     title_text = common.clip(title, MAX_TITLE_LENGTH) or "未命名作品"
-    if "仅标题" in choice:
-        return title_text
-
     platform = str(media.get("platform_name") or "")
     head = f"【{platform}】{title_text}" if platform else title_text
     parts: list[str] = []
@@ -201,31 +207,32 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     """把作品里的视频/图片转成宿主待发队列条目。
 
     宿主会在 AI 正文发出之后逐条补发这些媒体；发不出来就只记日志，不再补
-    直链，也不会改变已经发出的正文。视频条目带 ``caption`` 时，宿主会把
-    文案与视频合并成同一条消息发出，在群里渲染成卡片样式。
+    直链，也不会改变已经发出的正文。
 
-    两种发送方式：
-    - 发送视频文件：视频地址交给宿主上传/回源，群里是可播放的视频；
-    - 发送去水印直链：只排一条文本，直链本身是平台的无水印地址。
+    「回复样式」两档：
+    - 发送视频：视频地址交给宿主上传/回源，群里是可播放的视频；
+    - 发送无水印直链：不传文件，只把平台的去水印地址当文本发出去。
+
+    「是否合并发送」打开时文案与视频/链接合成一条消息（群聊里渲染成卡片）；
+    关闭时文案单独先发一条，媒体跟在后面。
     """
     items: list[dict[str, Any]] = []
     caption = _caption_for(host, media)
+    merged = _switch_config(host, "merge_caption", True)
     if str(media.get("kind") or "") == "images":
         for url in (media.get("images") or [])[:MAX_IMAGE_ATTACHMENTS]:
             if url:
                 items.append({"type": "image", "file": str(url)})
         live = common.text_of(media.get("live_video_url"))
         if live:
+            if caption and not merged:
+                items.append({"type": "text", "text": caption})
             video_item: dict[str, Any] = {"type": "video", "file": live}
-            if caption:
+            if caption and merged:
                 video_item["caption"] = caption
             items.append(video_item)
         return items
 
-    # 旧版本装过来的配置可能还留着「只发链接」，按「不发送媒体」处理。
-    choice = _choice(host, "send_video", "发送视频")
-    if choice in {"不发送视频", "只发链接"}:
-        return items
     limit = _int_config(host, "max_duration", 0, 0, MAX_DURATION_LIMIT)
     duration = media.get("duration") or 0
     if limit and duration and duration > limit:
@@ -233,21 +240,22 @@ def _attachments(host: Any, media: dict[str, Any]) -> list[dict[str, Any]]:
     play_url = str(media.get("play_url") or "")
     if not play_url:
         return items
-    # 「发送去水印直链」：不传文件，把直链当文本发出去。
-    send_mode = _choice(host, "video_send_mode", "发送视频文件")
-    if "直链" in send_mode:
-        merged = _choice(host, "merge_caption_video", "合并")
-        if caption and "合并" in merged:
+
+    if "直链" in _choice(host, "reply_style", "发送视频"):
+        if not caption:
+            items.append({"type": "text", "text": play_url})
+        elif merged:
             items.append({"type": "text", "text": f"{caption}\n{play_url}"})
         else:
-            # 分开：先发文案（有的话），再发链接；顺序与视频文件模式一致。
-            if caption:
-                items.append({"type": "text", "text": caption})
+            items.append({"type": "text", "text": caption})
             items.append({"type": "text", "text": play_url})
         return items
+
+    if caption and not merged:
+        # 不合并：文案先单独发，视频跟在后面，顺序与直链模式一致。
+        items.append({"type": "text", "text": caption})
     item: dict[str, Any] = {"type": "video", "file": play_url}
-    merged = _choice(host, "merge_caption_video", "合并")
-    if caption and "合并" in merged:
+    if caption and merged:
         item["caption"] = caption
     mirror = str(media.get("play_url_mirror") or "")
     if mirror and mirror != play_url:
