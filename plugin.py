@@ -248,6 +248,9 @@ def _attachments(
     - 发送视频：视频地址交给宿主上传/回源，群里是可播放的视频；
     - 发送无水印直链：不传文件，只把平台的去水印地址当文本发出去。
 
+    这里还有一道体积兜底：解析器按预算挑过档，但如果整条视频连最小档都装不进
+    预算，就直接走直链。宿主转存有体积上限，超了会跳过，视频段必然到不了。
+
     文案挂在视频条目上（``caption``），由宿主决定怎么发：
     - 合并发送打开：文案和视频装进一张聊天记录卡片，群里是「查看 2 条转发消息」；
       接入端不支持时宿主会自动退回两条；
@@ -278,6 +281,24 @@ def _attachments(
     if not play_url:
         host.log("不发送视频：没有解析到播放地址")
         return items, "没有解析到播放地址"
+
+    # 体积兜底：解析时已经按预算挑过一轮档，但整条视频连最小档都装不进预算时，
+    # 发视频段只会被宿主跳过，群里什么都没留下。这种情况直接改发无水印直链，
+    # 比发一个注定失败的视频强。
+    budget = _video_budget_bytes(host)
+    size = int(media.get("size") or 0)
+    if budget and size > budget:
+        actual_mb = size / (1024 * 1024)
+        host.log(
+            f"视频约 {actual_mb:.0f}MB，超过体积预算 "
+            f"{budget // (1024 * 1024)}MB，改为发送无水印直链"
+        )
+        # 有 302 原画端点就用它：无水印、画质最高、点开即播。
+        link = str(media.get("share_url") or "") or play_url
+        head = "视频太大发不了，无水印原画质直链："
+        text = f"{caption}\n{head}\n{link}" if caption else f"{head}\n{link}"
+        items.append({"type": "text", "text": text})
+        return items, ""
 
     style = _choice(host, "reply_style", "发送视频")
     host.log(
@@ -335,7 +356,8 @@ def _hint(has_media: bool) -> str:
     """给模型的提示：这一轮有没有排队媒体，说法不一样。
 
     没排上媒体还按「已发送」的口吻回复，群里就会出现「视频发你了」但什么都
-    没到的情况，所以要把结论直接写进提示里。
+    没到的情况，所以要把结论直接写进提示里。体积兜底改成发直链时同样按「没有
+    媒体」处理：发出去的是一条文字链接，不该说成视频。
     """
     head = "作品信息以 card 为准，card 里的「作品原文」是发布者写的完整文案；"
     tail = (
@@ -365,6 +387,11 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
     # 放在最后：返回给模型时可能被长度裁剪，前面的信息不能先被挤掉。
     # 宿主在裁剪前就取走这一项登记待发媒体，模型不需要看到这些地址。
     attachments, skipped = _attachments(host, media)
+    # 只有真的会发出视频/图片才算「有媒体」。体积兜底改成直链时排的是文本，
+    # 这时要按没有媒体提示模型，否则它会说「视频发你了」而群里只有一条链接。
+    sent_media = any(
+        str(item.get("type")) in {"video", "image"} for item in attachments
+    )
     payload: dict[str, Any] = {
         "ok": True,
         "platform": str(media.get("platform_name") or ""),
@@ -376,7 +403,7 @@ def _tool_payload(media: dict[str, Any], url: str, host: Any) -> dict[str, Any]:
         "kind": str(media.get("kind") or ""),
         "image_count": len(media.get("images") or []),
         "card": _describe(media),
-        "hint": _hint(bool(attachments)),
+        "hint": _hint(sent_media),
     }
     if attachments:
         payload["attachments"] = attachments

@@ -496,7 +496,7 @@ def _build(
         raise VideoParseError(
             "作品里没有找到可播放的地址", "可能是直播回放、合集或受限作品"
         )
-    height, _bitrate, label, url, mirrors = picked
+    height, bitrate, label, url, mirrors = picked
     media["play_url"] = url
     if mirrors:
         media["play_url_mirrors"] = mirrors
@@ -508,6 +508,13 @@ def _build(
     label = label or (f"{height}P" if height else "")
     if label:
         media["quality"] = label
+    # 上面已经按预算挑过一轮档，但全都超预算时 _pick_video 会退到最小的那档——
+    # 那一档照样发不出去。把估算体积带上去，让上层直接改发直链，
+    # 别再花时间转存一个注定失败的视频。
+    if budget_bytes > 0 and bitrate > 0 and duration_ms > 0:
+        estimated = bitrate * duration_ms // 8000
+        if estimated > budget_bytes:
+            media["size"] = estimated
     return media
 
 

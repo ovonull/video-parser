@@ -148,7 +148,7 @@ def mirror_play_url(url: str) -> str:
 
 async def _pick_play_url(
     bvid: str, cid: int, cookie: str, host: Any, chain: tuple[int, ...] | None = None
-) -> tuple[str, str]:
+) -> tuple[str, str, int]:
     """
     取单文件播放地址，按配置给的清晰度序列逐级降级。
 
@@ -156,7 +156,8 @@ async def _pick_play_url(
         chain: qn 降级序列；不传时用「自动最高」的 1080P → 720P → 480P → 360P。
 
     Returns:
-        (播放地址, 清晰度名称)。
+        (播放地址, 清晰度名称, 文件大小)。大小取不到时为 0；只用于判断
+        这条视频值不值得发成视频消息，不参与别处计算。
     """
     headers = _api_headers(cookie)
     last_message = ""
@@ -187,13 +188,17 @@ async def _pick_play_url(
         url = common.text_of(durl[0].get("url"))
         if not url:
             continue
+        try:
+            size = int(durl[0].get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
         quality = data.get("quality") or qn
         try:
             quality = int(quality)
         except (TypeError, ValueError):
             quality = qn
         _, label = QUALITY_TABLE.get(quality, (None, f"{quality}P"))
-        return url, label
+        return url, label, size
     raise VideoParseError(
         "没有取到可播放地址" + (f"（{last_message}）" if last_message else ""),
         "该视频可能需要大会员，或已限制外部分享",
@@ -238,7 +243,7 @@ async def parse(
     if not cid:
         raise VideoParseError("这个视频没有可播放的分集信息")
 
-    play_url, quality_label = await _pick_play_url(
+    play_url, quality_label, size = await _pick_play_url(
         common.text_of(data.get("bvid")) or bvid,
         cid,
         cookie,
@@ -246,7 +251,7 @@ async def parse(
         quality_chain(quality),
     )
     owner = data.get("owner") or {}
-    return {
+    media: dict[str, Any] = {
         "platform": "bilibili",
         "platform_name": "哔哩哔哩",
         "kind": "video",
@@ -263,3 +268,7 @@ async def parse(
         "part": _page_title(data, page),
         "source_url": url,
     }
+    if size:
+        # durl 给的是真实字节数，比抖音那边按码率估算的准。
+        media["size"] = size
+    return media
